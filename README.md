@@ -454,7 +454,7 @@ This project is licensed under the MIT-0 License. See the [LICENSE](LICENSE) fil
 ## Related Links
 
 - [Amazon Bedrock AgentCore documentation](https://docs.aws.amazon.com/bedrock-agentcore/)
-- [AgentCore Samples (parent repo)](https://github.com/awslabs/amazon-bedrock-agentcore-samples)
+- [Other AgentCore Samples](https://github.com/awslabs/amazon-bedrock-agentcore-samples)
 - [OpenCode](https://opencode.ai)
 - [Model Context Protocol](https://modelcontextprotocol.io)
 
