@@ -1,4 +1,4 @@
-boto3==1.42.88
+boto3==1.43.31
 fastmcp==3.2.0
 bedrock-agentcore==1.18.1
 opentelemetry-api==1.40.0
