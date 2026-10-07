@@ -1,0 +1,27 @@
+# Dependabot security updates are enabled for this repository. This file only
+# shapes them; it does not turn on routine version-update pull requests
+# (open-pull-requests-limit: 0 disables those, and security updates are not
+# subject to that limit).
+#
+# The container pins boto3 and bedrock-agentcore with ==, and
+# bedrock-agentcore declares a minimum boto3 version. Grouping keeps the AWS
+# SDK packages together so one pull request carries them all.
+#
+# Always confirm that `docker build container/` (or at least
+# `pip install --dry-run -r container/requirements.txt`) succeeds before
+# merging a dependency pull request, because a grouped update can still leave
+# an unresolvable pin set.
+version: 2
+updates:
+  - package-ecosystem: "pip"
+    directory: "/container"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 0
+    groups:
+      aws-sdk:
+        applies-to: security-updates
+        patterns:
+          - "boto3"
+          - "botocore"
+          - "bedrock-agentcore"
