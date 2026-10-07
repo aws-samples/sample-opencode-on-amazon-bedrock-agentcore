@@ -82,24 +82,24 @@ class TestVpcEndpoints:
         )
 
     def test_interface_endpoint_count(self):
-        """11 interface endpoints: ECR API, ECR DKR, CloudWatch Logs,
-        CloudWatch Monitoring, KMS, STS, Secrets Manager, Lambda,
-        Bedrock Runtime, X-Ray, Bedrock AgentCore."""
+        """9 interface endpoints: ECR API, ECR DKR, CloudWatch Logs,
+        CloudWatch Monitoring, KMS, Secrets Manager, Bedrock Runtime,
+        X-Ray, Bedrock AgentCore."""
         template = _build_vpc_template()
         resources = template.find_resources(
             "AWS::EC2::VPCEndpoint",
             {"Properties": {"VpcEndpointType": "Interface"}},
         )
-        assert len(resources) == 11, (
-            f"Expected 11 interface endpoints, found {len(resources)}"
+        assert len(resources) == 9, (
+            f"Expected 9 interface endpoints, found {len(resources)}"
         )
 
     def test_total_vpc_endpoint_count(self):
-        """13 total VPC endpoints (2 gateway + 11 interface)."""
+        """11 total VPC endpoints (2 gateway + 9 interface)."""
         template = _build_vpc_template()
         resources = template.find_resources("AWS::EC2::VPCEndpoint")
-        assert len(resources) == 13, (
-            f"Expected 13 total VPC endpoints, found {len(resources)}"
+        assert len(resources) == 11, (
+            f"Expected 11 total VPC endpoints, found {len(resources)}"
         )
 
     def test_bedrock_runtime_endpoint_exists(self):
@@ -150,15 +150,6 @@ class TestVpcEndpoints:
             },
         )
 
-    def test_sts_endpoint_exists(self):
-        template = _build_vpc_template()
-        template.has_resource_properties(
-            "AWS::EC2::VPCEndpoint",
-            {
-                "ServiceName": assertions.Match.string_like_regexp(".*sts$"),
-                "VpcEndpointType": "Interface",
-            },
-        )
 
     def test_cloudwatch_logs_endpoint_exists(self):
         template = _build_vpc_template()

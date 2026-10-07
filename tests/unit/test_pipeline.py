@@ -58,11 +58,14 @@ _WORK_DIR = "/tmp/pipeline-unit/j1"
 _TIMEOUT_MINUTES = 10
 
 #: Expected ordered sequence of step-function invocations on the success path.
+#: ``query_job_record`` is the pre-push status re-read that guards against
+#: cross-session cancellation (``container.pipeline._ensure_still_running``).
 _EXPECTED_STEP_ORDER: list[str] = [
     "resolve_git_credential",
     "git_clone",
-    "run_opencode_acp_impl",
-    "scan_and_strip_credentials_impl",
+    "run_opencode_acp",
+    "scan_and_strip_credentials",
+    "query_job_record",
     "git_push_and_create_pr",
 ]
 
@@ -450,16 +453,17 @@ async def test_oauth_case_3_confirmed_valid_retry() -> None:
         f"{len(oauth_calls)}: {oauth_calls!r}"
     )
 
-    # Pipeline proceeded through all 5 Step_Functions. Total recorded
-    # step calls is 6 because ``resolve_git_credential`` was invoked
-    # twice (initial + retry).
+    # Pipeline proceeded through all 5 Step_Functions (plus the pre-push
+    # status re-read). Total recorded step calls is 7 because
+    # ``resolve_git_credential`` was invoked twice (initial + retry).
     observed_step_names = [call.name for call in recorder.step_calls]
     assert observed_step_names == [
         "resolve_git_credential",
         "resolve_git_credential",
         "git_clone",
-        "run_opencode_acp_impl",
-        "scan_and_strip_credentials_impl",
+        "run_opencode_acp",
+        "scan_and_strip_credentials",
+        "query_job_record",
         "git_push_and_create_pr",
     ], (
         f"Step call sequence did not match the documented order with "
@@ -549,7 +553,7 @@ async def test_oauth_case_4_confirmed_unauthorized_retry() -> None:
 # collapse into a single unit-test case because ``PipelineRecorder``
 # patches the top-level ``git_clone`` function rather than the
 # ``subprocess.run`` calls for ``git config`` / ``git checkout -b`` that
-# live inside the pipeline body. Rows 7 and 8 (``run_opencode_acp_impl``
+# live inside the pipeline body. Rows 7 and 8 (``run_opencode_acp``
 # RuntimeError vs. timeout) are both exercised by injecting different
 # RuntimeError messages into the same step function. Row 11
 # (``git_push_and_create_pr`` returning ``pr_url=None``) is covered by
@@ -682,11 +686,11 @@ async def test_step_failure_git_clone_raises() -> None:
 
 @pytest.mark.asyncio
 async def test_step_failure_run_opencode_acp_raises_runtime_error() -> None:
-    """Row 7: ``run_opencode_acp_impl`` raises a ``RuntimeError`` (ACP error).
+    """Row 7: ``run_opencode_acp`` raises a ``RuntimeError`` (ACP error).
 
     **Validates: Requirements 10.3, 7.1, 7.2, 7.4, 7.5, 9.7**
 
-    When ``run_opencode_acp_impl`` raises an ACP-protocol
+    When ``run_opencode_acp`` raises an ACP-protocol
     ``RuntimeError`` (non-zero exit from the OpenCode subprocess), the
     pipeline must write ``FAILED``, emit ``code.failure``, and return
     ``status="failed"`` with ``error=str(exc)``.
@@ -734,11 +738,11 @@ async def test_step_failure_run_opencode_acp_raises_runtime_error() -> None:
 
 @pytest.mark.asyncio
 async def test_step_failure_run_opencode_acp_raises_timeout() -> None:
-    """Row 8: ``run_opencode_acp_impl`` raises a timeout ``RuntimeError``.
+    """Row 8: ``run_opencode_acp`` raises a timeout ``RuntimeError``.
 
     **Validates: Requirements 10.3, 7.1, 7.2, 7.4, 7.5, 9.7**
 
-    When ``run_opencode_acp_impl`` raises
+    When ``run_opencode_acp`` raises
     ``RuntimeError("OpenCode timed out after ...")``, the pipeline
     must classify it identically to Row 7: write ``FAILED``, emit
     ``code.failure``, and return ``status="failed"`` with
@@ -789,11 +793,11 @@ async def test_step_failure_run_opencode_acp_raises_timeout() -> None:
 
 @pytest.mark.asyncio
 async def test_step_failure_scan_and_strip_credentials_raises() -> None:
-    """Row 9: ``scan_and_strip_credentials_impl`` raises (file I/O, etc.).
+    """Row 9: ``scan_and_strip_credentials`` raises (file I/O, etc.).
 
     **Validates: Requirements 10.4, 7.1, 7.2, 7.4, 7.5, 9.7**
 
-    When ``scan_and_strip_credentials_impl`` raises any exception
+    When ``scan_and_strip_credentials`` raises any exception
     (typical cause: file I/O error while scanning the work directory),
     the pipeline must write ``FAILED``, emit ``code.failure``, and
     return ``status="failed"`` with ``error=str(exc)``.
@@ -1002,13 +1006,13 @@ _STEPS_BEFORE_CHECKPOINT: dict[int, list[str]] = {
     4: [
         "resolve_git_credential",
         "git_clone",
-        "run_opencode_acp_impl",
+        "run_opencode_acp",
     ],
     5: [
         "resolve_git_credential",
         "git_clone",
-        "run_opencode_acp_impl",
-        "scan_and_strip_credentials_impl",
+        "run_opencode_acp",
+        "scan_and_strip_credentials",
     ],
 }
 
@@ -1472,3 +1476,355 @@ async def test_runtime_session_id_is_persisted_on_initial_record() -> None:
         f"Expected exactly one async_task.duration histogram, got "
         f"{histogram_names!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# WI-2: base/target guard and no-op (no changes -> no PR) pipeline tests.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_target_branch_equals_base_branch_fails() -> None:
+    """A ``target_branch`` equal to ``base_branch`` is rejected up front.
+
+    Pushing onto the base branch is refused the same way as a malformed
+    ``repo_url``: a ``ValueError`` before any RUNNING row is written or any
+    step runs.
+    """
+    recorder = PipelineRecorder()
+    with recorder.patch():
+        with pytest.raises(ValueError, match="differ"):
+            await run_coding_pipeline(
+                user_id=_USER_ID,
+                job_id=_JOB_ID,
+                task_description=_TASK_DESCRIPTION,
+                repo_url=_REPO_URL,
+                base_branch="main",
+                target_branch="main",
+                work_dir=_WORK_DIR,
+                timeout_minutes=_TIMEOUT_MINUTES,
+                on_progress=None,
+                on_oauth_needed=None,
+                cancel_flag=None,
+                metric_prefix="code",
+            )
+
+    assert recorder.step_calls == [], (
+        f"Expected no step functions to run, got "
+        f"{[c.name for c in recorder.step_calls]!r}"
+    )
+    assert recorder.ddb_writes == [], (
+        f"Expected no DDB writes, got "
+        f"{[(w.kind, w.status) for w in recorder.ddb_writes]!r}"
+    )
+    assert recorder.metric_events == []
+
+
+@pytest.mark.asyncio
+async def test_noop_task_produces_no_pr() -> None:
+    """A no-op task (push returns ``pushed=False``) still completes cleanly.
+
+    When ``git_push_and_create_pr`` reports ``{"pr_url": None,
+    "pushed": False}`` (nothing to push), the pipeline must treat the run
+    as successful with ``pr_url == ""`` (``None`` mapped to empty string).
+    """
+    recorder = PipelineRecorder(
+        push_result={"pr_url": None, "pushed": False}
+    )
+    with recorder.patch():
+        result = await run_coding_pipeline(
+            user_id=_USER_ID,
+            job_id=_JOB_ID,
+            task_description=_TASK_DESCRIPTION,
+            repo_url=_REPO_URL,
+            base_branch=_BASE_BRANCH,
+            target_branch=_TARGET_BRANCH,
+            work_dir=_WORK_DIR,
+            timeout_minutes=_TIMEOUT_MINUTES,
+            on_progress=None,
+            on_oauth_needed=None,
+            cancel_flag=None,
+            metric_prefix="code",
+        )
+
+    assert result["status"] == "complete", (
+        f"Expected status='complete' for a no-op task, got result={result!r}"
+    )
+    assert result.get("pr_url") == "", (
+        f"Expected pr_url='' when push returned pr_url=None, "
+        f"got result={result!r}"
+    )
+
+    ddb_statuses = [w.status for w in recorder.ddb_writes]
+    assert ddb_statuses == ["RUNNING", "COMPLETE"], (
+        f"Expected DDB transition RUNNING -> COMPLETE, got {ddb_statuses!r}"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "ssh_url",
+    [
+        "git@github.com:owner/repo.git",
+        "git@gitlab.com:group/project.git",
+    ],
+)
+async def test_ssh_repo_url_rejected(ssh_url: str) -> None:
+    """An SSH-style ``repo_url`` is rejected before any pipeline step.
+
+    The whole pipeline assumes an HTTPS transport: the OAuth token is
+    supplied over HTTPS via GIT_ASKPASS, the push URL is derived by
+    rewriting the ``https://`` prefix, and the GitHub PR parser only
+    recognises the HTTPS URL shape. An accepted ``git@`` value would be a
+    no-op for the push-URL rewrite and fall back to an unconstrained SSH
+    transport, so the pipeline must reject it with a ``ValueError`` up
+    front (before any RUNNING row is written or any step runs).
+    """
+    recorder = PipelineRecorder()
+    with recorder.patch():
+        with pytest.raises(ValueError, match="https://"):
+            await run_coding_pipeline(
+                user_id=_USER_ID,
+                job_id=_JOB_ID,
+                task_description=_TASK_DESCRIPTION,
+                repo_url=ssh_url,
+                base_branch=_BASE_BRANCH,
+                target_branch=_TARGET_BRANCH,
+                work_dir=_WORK_DIR,
+                timeout_minutes=_TIMEOUT_MINUTES,
+                on_progress=None,
+                on_oauth_needed=None,
+                cancel_flag=None,
+                metric_prefix="code",
+            )
+
+    # Rejected before any step ran and before any audit record was written.
+    assert recorder.step_calls == [], (
+        f"Expected no step functions to run, got "
+        f"{[c.name for c in recorder.step_calls]!r}"
+    )
+    assert recorder.ddb_writes == [], (
+        f"Expected no DDB writes for a rejected SSH URL, got "
+        f"{[(w.kind, w.status) for w in recorder.ddb_writes]!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_https_repo_url_accepted() -> None:
+    """An HTTPS ``repo_url`` passes validation and runs the pipeline.
+
+    Companion to ``test_ssh_repo_url_rejected``: pins that the HTTPS-only
+    policy still admits the supported scheme end to end.
+    """
+    recorder = PipelineRecorder()
+    with recorder.patch():
+        result = await run_coding_pipeline(
+            user_id=_USER_ID,
+            job_id=_JOB_ID,
+            task_description=_TASK_DESCRIPTION,
+            repo_url="https://github.com/owner/repo",
+            base_branch=_BASE_BRANCH,
+            target_branch=_TARGET_BRANCH,
+            work_dir=_WORK_DIR,
+            timeout_minutes=_TIMEOUT_MINUTES,
+            on_progress=None,
+            on_oauth_needed=None,
+            cancel_flag=None,
+            metric_prefix="code",
+        )
+
+    assert result["status"] == "complete", (
+        f"Expected an HTTPS repo_url to run the pipeline, got {result!r}"
+    )
+    assert recorder.step_calls, "Expected the pipeline steps to run"
+
+
+def _run_pipeline_kwargs(**overrides):
+    kwargs = dict(
+        user_id=_USER_ID,
+        job_id=_JOB_ID,
+        task_description=_TASK_DESCRIPTION,
+        repo_url=_REPO_URL,
+        base_branch=_BASE_BRANCH,
+        target_branch=_TARGET_BRANCH,
+        work_dir=_WORK_DIR,
+        timeout_minutes=_TIMEOUT_MINUTES,
+        on_progress=None,
+        on_oauth_needed=None,
+        cancel_flag=None,
+        metric_prefix="code",
+    )
+    kwargs.update(overrides)
+    return kwargs
+
+
+@pytest.mark.asyncio
+async def test_base_sha_from_rev_parse_flows_to_scan_and_push() -> None:
+    """``git rev-parse HEAD`` output (stripped) is passed as ``base_sha``."""
+    sha = "0123456789abcdef0123456789abcdef01234567"
+
+    def _fake_run(cmd, **kwargs):
+        result = subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        if cmd[:2] == ["git", "rev-parse"]:
+            result.stdout = sha + "\n"
+        return result
+
+    recorder = PipelineRecorder()
+    with recorder.patch(), patch.object(
+        pipeline_module.subprocess, "run", side_effect=_fake_run,
+    ):
+        result = await run_coding_pipeline(**_run_pipeline_kwargs())
+
+    assert result["status"] == "complete"
+    by_name = {c.name: c for c in recorder.step_calls}
+    assert by_name["scan_and_strip_credentials"].kwargs["base_sha"] == sha
+    assert by_name["git_push_and_create_pr"].kwargs["base_sha"] == sha
+
+
+# ---------------------------------------------------------------------------
+# Cross-session cancellation guard: pre-push status re-read and conditional
+# terminal write (``JobStateConflict``).
+#
+# ``cancel_task`` on another microVM records CANCELLED after a successful
+# StopRuntimeSession. The pipeline must (a) re-read the job record right
+# before the push and skip it when the record is no longer RUNNING, and
+# (b) treat a ``JobStateConflict`` from the COMPLETE write as "cancelled
+# externally" rather than as a success or an exception.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_prepush_reread_cancelled_skips_push() -> None:
+    """Record is CANCELLED before the push -> push skipped, status 'cancelled'."""
+    recorder = PipelineRecorder(
+        query_job_record_results=[{"status": "CANCELLED"}],
+    )
+    with recorder.patch():
+        result = await run_coding_pipeline(
+            **_run_pipeline_kwargs(metric_prefix="async_task")
+        )
+
+    assert result["status"] == "cancelled"
+    assert result["error"] == "Task cancelled"
+
+    step_names = [c.name for c in recorder.step_calls]
+    assert "git_push_and_create_pr" not in step_names, step_names
+    assert step_names[-1] == "query_job_record", step_names
+
+    # One CANCELLED write was attempted (it is conditional, so when the
+    # other writer already recorded CANCELLED it raises JobStateConflict
+    # and is logged; the attempt itself must still happen exactly once).
+    terminal_writes = [w for w in recorder.ddb_writes if w.kind == "update_job_status"]
+    assert [w.status for w in terminal_writes] == ["CANCELLED"]
+
+    assert [e.name for e in recorder.metric_events] == ["async_task.cancelled"]
+
+
+@pytest.mark.asyncio
+async def test_prepush_reread_cancelled_conflict_on_cancelled_write_is_quiet() -> None:
+    """Pre-push CANCELLED + CANCELLED write conflict -> no exception, no error log."""
+    recorder = PipelineRecorder(
+        query_job_record_results=[{"status": "CANCELLED"}],
+        update_job_status_conflict_on="CANCELLED",
+    )
+    with recorder.patch(), patch.object(
+        pipeline_module.logger, "exception"
+    ) as mock_exc:
+        result = await run_coding_pipeline(
+            **_run_pipeline_kwargs(metric_prefix="async_task")
+        )
+
+    assert result["status"] == "cancelled"
+    # JobStateConflict is an expected race, not a DDB failure.
+    mock_exc.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_complete_write_conflict_returns_cancelled() -> None:
+    """COMPLETE write raises JobStateConflict -> status 'cancelled', no raise."""
+    recorder = PipelineRecorder(update_job_status_conflict_on="COMPLETE")
+    with recorder.patch():
+        result = await run_coding_pipeline(**_run_pipeline_kwargs())
+
+    assert result["status"] == "cancelled"
+    assert result["pr_url"] == "https://github.com/owner/repo/pull/1"
+    assert "PR may exist" in result["error"]
+    assert result["error"].endswith("https://github.com/owner/repo/pull/1")
+    assert isinstance(result["duration_seconds"], float)
+
+    # The push did happen (the race was lost after it).
+    step_names = [c.name for c in recorder.step_calls]
+    assert step_names[-1] == "git_push_and_create_pr"
+
+    # Exactly one terminal write was attempted (COMPLETE, refused); the
+    # pipeline does not try to overwrite the row with anything else.
+    terminal_writes = [w for w in recorder.ddb_writes if w.kind == "update_job_status"]
+    assert [w.status for w in terminal_writes] == ["COMPLETE"]
+
+    # Metric: cancelled, not success; no duration histogram.
+    assert [e.name for e in recorder.metric_events] == ["code.cancelled"]
+    assert recorder.histogram_events == []
+
+
+@pytest.mark.asyncio
+async def test_complete_write_conflict_without_pr_url() -> None:
+    """COMPLETE conflict with no PR -> generic 'cancelled while completing'."""
+    recorder = PipelineRecorder(
+        update_job_status_conflict_on="COMPLETE",
+        push_result={"pr_url": None, "pushed": False},
+    )
+    with recorder.patch():
+        result = await run_coding_pipeline(**_run_pipeline_kwargs())
+
+    assert result["status"] == "cancelled"
+    assert result["error"] == "Task cancelled while completing"
+    assert result["pr_url"] == ""
+
+
+@pytest.mark.asyncio
+async def test_failed_write_conflict_is_logged_not_raised() -> None:
+    """FAILED write raises JobStateConflict -> result still 'failed', no exception log."""
+    recorder = PipelineRecorder(
+        opencode_side_effect=RuntimeError("acp exploded"),
+        update_job_status_conflict_on="FAILED",
+    )
+    with recorder.patch(), patch.object(
+        pipeline_module.logger, "exception"
+    ) as mock_exc:
+        result = await run_coding_pipeline(**_run_pipeline_kwargs())
+
+    assert result["status"] == "failed"
+    assert result["error"] == "acp exploded"
+    # ``logger.exception`` is still called once for the pipeline failure
+    # itself, but NOT a second time for the refused FAILED write.
+    assert mock_exc.call_count == 1
+    assert "Pipeline failed" in mock_exc.call_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_happy_path_rereads_record_once_before_push() -> None:
+    """Happy path: exactly one query_job_record, after scan and before push."""
+    recorder = PipelineRecorder()
+    with recorder.patch():
+        result = await run_coding_pipeline(**_run_pipeline_kwargs())
+
+    assert result["status"] == "complete"
+    step_names = [c.name for c in recorder.step_calls]
+    assert step_names.count("query_job_record") == 1
+    assert step_names.index("scan_and_strip_credentials") < step_names.index(
+        "query_job_record"
+    ) < step_names.index("git_push_and_create_pr")
+
+    reread = next(c for c in recorder.step_calls if c.name == "query_job_record")
+    assert reread.kwargs == {"job_id": _JOB_ID, "user_id": _USER_ID}
+
+
+@pytest.mark.asyncio
+async def test_prepush_reread_missing_record_does_not_abort() -> None:
+    """A ``None`` re-read (record not found) is treated as still RUNNING."""
+    recorder = PipelineRecorder(query_job_record_results=[None])
+    with recorder.patch():
+        result = await run_coding_pipeline(**_run_pipeline_kwargs())
+
+    assert result["status"] == "complete"
+    assert [c.name for c in recorder.step_calls][-1] == "git_push_and_create_pr"

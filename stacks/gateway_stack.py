@@ -1,9 +1,14 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: MIT-0
-"""OpenCode Gateway stack — Managed AgentCore Gateway with interceptor.
+"""OpenCode Gateway stack — Managed AgentCore Gateway, interceptor, Cedar engine.
 
 Serverless MCP gateway with per-user identity via REQUEST interceptor.
 The interceptor extracts user_id from the JWT and injects it into tool arguments.
+
+The stack also owns the Cedar ``CfnPolicyEngine`` the Gateway is associated
+with (LOG_ONLY mode). Cedar policies themselves are created post-deploy via
+scripts/create-policies.py using the boto3 API, because the CfnPolicy
+CloudFormation resource handler has stabilization issues (NotStabilized).
 
 The single MCP ``GatewayTarget`` (``opencode``) and the Gateway to
 ``PolicyEngine`` association are both expressed in CloudFormation via the
@@ -29,7 +34,7 @@ from stacks import retention_days
 
 
 class GatewayStack(cdk.Stack):
-    """Gateway stack — Gateway, MCP target, and Cedar PolicyEngine link."""
+    """Gateway stack — Gateway, MCP target, and Cedar PolicyEngine."""
 
     def __init__(
         self,
@@ -39,7 +44,6 @@ class GatewayStack(cdk.Stack):
         cognito_user_pool: cognito.IUserPool,
         cognito_client_id: str,
         opencode_runtime: bedrockagentcore.CfnRuntime,
-        policy_engine_arn: str,
         cmk: kms.IKey,
         **kwargs,
     ) -> None:
@@ -52,6 +56,28 @@ class GatewayStack(cdk.Stack):
             f"/{cognito_user_pool.user_pool_id}/.well-known/openid-configuration"
         )
 
+        # Verbose exception surfacing (DEBUG) leaks internal error detail to
+        # callers, so it is OFF by default. Opt in per deployment with the
+        # `gateway_exception_level` CDK context flag set to "DEBUG". Any
+        # other / unset value leaves the gateway at its least-verbose default.
+        exception_level_ctx = self.node.try_get_context("gateway_exception_level")
+        exception_level = (
+            agentcore.GatewayExceptionLevel.DEBUG
+            if isinstance(exception_level_ctx, str)
+            and exception_level_ctx.strip().upper() == "DEBUG"
+            else None
+        )
+
+        # -----------------------------------------------------------------
+        # Cedar Policy Engine (policies added post-deploy)
+        # -----------------------------------------------------------------
+        self.policy_engine = bedrockagentcore.CfnPolicyEngine(
+            self,
+            "OpenCodePolicyEngine",
+            name="opencode_policy_engine",
+            description="Cedar policy engine for OpenCode role-based access control",
+        )
+
         self.gateway = agentcore.Gateway(
             self,
             "OpenCodeGateway",
@@ -61,7 +87,7 @@ class GatewayStack(cdk.Stack):
                 discovery_url=discovery_url,
                 allowed_audience=[cognito_client_id],
             ),
-            exception_level=agentcore.GatewayExceptionLevel.DEBUG,
+            exception_level=exception_level,
         )
 
         # -----------------------------------------------------------------
@@ -216,7 +242,29 @@ class GatewayStack(cdk.Stack):
         cfn_gateway: bedrockagentcore.CfnGateway = self.gateway.node.default_child  # type: ignore[assignment]
         cfn_gateway.add_property_override(
             "PolicyEngineConfiguration",
-            {"Arn": policy_engine_arn, "Mode": "LOG_ONLY"},
+            {"Arn": self.policy_engine.attr_policy_engine_arn, "Mode": "LOG_ONLY"},
+        )
+        cfn_gateway.add_dependency(self.policy_engine)
+
+        # -----------------------------------------------------------------
+        # Response streaming — relay MCP notifications/progress to clients.
+        #
+        # The sync ``code`` tool reports pipeline progress (1/5 .. 5/5) via
+        # ``ctx.report_progress``. The Gateway only forwards those
+        # ``notifications/progress`` messages to the caller as SSE chunks when
+        # response streaming is enabled; without this flag it buffers the
+        # Runtime's stream and returns a plain ``application/json`` body with
+        # the final result only (observed live). Clients must send
+        # ``Accept: application/json, text/event-stream`` and a
+        # ``_meta.progressToken`` on ``tools/call`` to receive them.
+        #
+        # Deliberately NOT adding ``SessionConfiguration``: progress relay
+        # does not need it, and session stickiness would change the current
+        # one-call-per-microVM behaviour.
+        # -----------------------------------------------------------------
+        cfn_gateway.add_property_override(
+            "ProtocolConfiguration.Mcp.StreamingConfiguration.EnableResponseStreaming",
+            True,
         )
 
         # Make the Gateway explicitly depend on the Gateway role's
@@ -226,7 +274,7 @@ class GatewayStack(cdk.Stack):
         if gateway_role_default_policy is not None:
             cfn_default_policy = gateway_role_default_policy.node.default_child
             if cfn_default_policy is not None:
-                cfn_gateway.add_depends_on(cfn_default_policy)
+                cfn_gateway.add_dependency(cfn_default_policy)
 
         # -----------------------------------------------------------------
         # Outputs
@@ -234,6 +282,18 @@ class GatewayStack(cdk.Stack):
         cdk.CfnOutput(self, "GatewayId", value=self.gateway.gateway_id)
         cdk.CfnOutput(self, "GatewayUrl", value=self.gateway.gateway_url or "pending")
         cdk.CfnOutput(self, "GatewayArn", value=self.gateway.gateway_arn)
+        cdk.CfnOutput(
+            self,
+            "PolicyEngineId",
+            value=self.policy_engine.attr_policy_engine_id,
+            description="Cedar Policy Engine ID",
+        )
+        cdk.CfnOutput(
+            self,
+            "PolicyEngineArn",
+            value=self.policy_engine.attr_policy_engine_arn,
+            description="Cedar Policy Engine ARN",
+        )
 
         # -----------------------------------------------------------------
         # cdk-nag suppressions
@@ -268,6 +328,10 @@ class GatewayStack(cdk.Stack):
                 cdk_nag.NagPackSuppression(
                     id="AwsSolutions-L1",
                     reason="Python 3.14 is current stable runtime.",
+                ),
+                cdk_nag.NagPackSuppression(
+                    id="CdkNagValidationFailure",
+                    reason="CfnPolicyEngine is an L1 construct not yet covered by cdk-nag rules.",
                 ),
             ],
         )

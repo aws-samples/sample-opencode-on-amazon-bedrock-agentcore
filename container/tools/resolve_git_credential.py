@@ -34,7 +34,6 @@ CredentialResult = Union[GitCredentialResult, GitCredentialAuthRequired]
 def resolve_git_credential(
     user_id: str,
     repo_url: str,
-    workload_access_token: str = "",
 ) -> CredentialResult:
     """Resolve git credentials via AgentCore Identity SDK (3LO OAuth).
 
@@ -44,12 +43,10 @@ def resolve_git_credential(
     """
     client = _get_client()
 
-    token = workload_access_token
-    if not token:
-        resp = client.get_workload_access_token_for_user_id(
-            workloadName=WORKLOAD_NAME, userId=user_id
-        )
-        token = resp["workloadAccessToken"]
+    resp = client.get_workload_access_token_for_user_id(
+        workloadName=WORKLOAD_NAME, userId=user_id
+    )
+    token = resp["workloadAccessToken"]
 
     from urllib.parse import urlparse
     domain = urlparse(repo_url).hostname or "github.com"

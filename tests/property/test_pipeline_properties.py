@@ -43,6 +43,7 @@ import container.pipeline as pipeline_module  # noqa: E402
 from container.lib.credential_errors import (  # noqa: E402
     GIT_HOST_NOT_CONNECTED_MESSAGE,
 )
+from container.lib.dynamodb_helpers import JobStateConflict  # noqa: E402
 from container.pipeline import (  # noqa: E402  (re-exported for test modules 2.2-2.8)
     CancelFlag,
     OnOAuthNeeded,
@@ -126,8 +127,13 @@ git_ref_st: st.SearchStrategy[str] = (
     .filter(lambda s: not s.startswith("-"))
 )
 
-base_branch_st: st.SearchStrategy[str] = git_ref_st
-target_branch_st: st.SearchStrategy[str] = git_ref_st
+# ``run_coding_pipeline`` rejects ``target_branch == base_branch`` (it
+# would push straight onto the base). Prefix the two branch strategies
+# with disjoint, ref-safe tokens so a drawn ``base_branch`` and
+# ``target_branch`` can never collide, keeping the property tests focused
+# on the behaviour they were written to exercise.
+base_branch_st: st.SearchStrategy[str] = git_ref_st.map(lambda s: f"base-{s}")
+target_branch_st: st.SearchStrategy[str] = git_ref_st.map(lambda s: f"tgt-{s}")
 
 #: Timeout in whole minutes, matching the ``[1, 30]`` bound enforced by the
 #: MCP tool validation layer.
@@ -182,7 +188,7 @@ def cancel_pattern_st(draw: st.DrawFn) -> list[bool]:
 # Default return value for ``resolve_git_credential`` -- a token, no OAuth.
 _DEFAULT_CRED: dict[str, Any] = {"token": "test-token"}
 
-# Default return value for ``run_opencode_acp_impl``.
+# Default return value for ``run_opencode_acp``.
 _DEFAULT_OPENCODE_RESULT: dict[str, Any] = {
     "stdout": "",
     "stderr": "",
@@ -270,6 +276,14 @@ class PipelineRecorder:
         - ``update_job_status_side_effect``: optional exception to raise from
           the terminal audit write (exercises Row 14 of the error
           classification table).
+        - ``update_job_status_conflict_on``: status name (``"COMPLETE"`` /
+          ``"FAILED"`` / ``"CANCELLED"``) whose terminal write raises
+          :class:`JobStateConflict` (the conditional DynamoDB write found
+          the row already terminal).
+        - ``query_job_record_results``: successive return values for the
+          pre-push ``query_job_record`` re-read. Defaults to a single
+          ``{"status": "RUNNING"}`` record; the last value is repeated
+          when exhausted.
 
     Recorded attributes (read by property tests):
         - ``step_calls`` (:class:`list` of :class:`StepCall`)
@@ -290,6 +304,10 @@ class PipelineRecorder:
     )
     push_result: dict = field(default_factory=lambda: dict(_DEFAULT_PUSH_RESULT))
     update_job_status_side_effect: Optional[BaseException] = None
+    update_job_status_conflict_on: Optional[str] = None
+    query_job_record_results: list[Optional[dict]] = field(
+        default_factory=lambda: [{"status": "RUNNING"}]
+    )
 
     # Recorded invocations (populated by the patched collaborators)
     step_calls: list[StepCall] = field(default_factory=list)
@@ -299,6 +317,7 @@ class PipelineRecorder:
 
     # Per-step invocation counters (handy for OAuth retry assertions)
     _cred_call_count: int = 0
+    _query_call_count: int = 0
 
     # ------------------------------------------------------------------
     # Step function fakes
@@ -318,21 +337,21 @@ class PipelineRecorder:
         if self.clone_side_effect is not None:
             raise self.clone_side_effect
 
-    async def _fake_run_opencode_acp_impl(
+    async def _fake_run_opencode_acp(
         self, *args: Any, **kwargs: Any
     ) -> dict:
         self.step_calls.append(
-            StepCall("run_opencode_acp_impl", args, dict(kwargs))
+            StepCall("run_opencode_acp", args, dict(kwargs))
         )
         if self.opencode_side_effect is not None:
             raise self.opencode_side_effect
         return dict(self.opencode_result)
 
-    def _fake_scan_and_strip_credentials_impl(
+    def _fake_scan_and_strip_credentials(
         self, *args: Any, **kwargs: Any
     ) -> Any:
         self.step_calls.append(
-            StepCall("scan_and_strip_credentials_impl", args, dict(kwargs))
+            StepCall("scan_and_strip_credentials", args, dict(kwargs))
         )
         if self.scan_side_effect is not None:
             raise self.scan_side_effect
@@ -345,6 +364,14 @@ class PipelineRecorder:
         if self.push_side_effect is not None:
             raise self.push_side_effect
         return dict(self.push_result)
+
+    # ``.git/config`` snapshot/restore are patched so the pipeline never
+    # touches a real ``.git`` directory.
+    def _fake_read_git_config(self, *args: Any) -> bytes:
+        return b"[core]\n\tsnapshot = true\n"
+
+    def _fake_restore_git_config(self, *args: Any) -> None:
+        return None
 
     # ------------------------------------------------------------------
     # DDB / metric fakes
@@ -370,6 +397,20 @@ class PipelineRecorder:
         )
         if self.update_job_status_side_effect is not None:
             raise self.update_job_status_side_effect
+        if (
+            self.update_job_status_conflict_on is not None
+            and status == self.update_job_status_conflict_on
+        ):
+            raise JobStateConflict(f"job is no longer RUNNING ({status} refused)")
+
+    async def _fake_query_job_record(self, *args: Any, **kwargs: Any) -> Optional[dict]:
+        # The pre-push re-read is recorded as a step so ordering properties
+        # can assert it happens after the scan and before the push.
+        self.step_calls.append(StepCall("query_job_record", args, dict(kwargs)))
+        idx = min(self._query_call_count, len(self.query_job_record_results) - 1)
+        self._query_call_count += 1
+        rec = self.query_job_record_results[idx]
+        return dict(rec) if rec is not None else None
 
     def _fake_record_metric(
         self,
@@ -395,7 +436,7 @@ class PipelineRecorder:
     # ------------------------------------------------------------------
     @contextmanager
     def patch(self) -> Iterator["PipelineRecorder"]:
-        """Apply all nine patches to ``container.pipeline``.
+        """Apply all collaborator patches to ``container.pipeline``.
 
         The pipeline imports its collaborators via
         ``from container.tools import ...`` / ``from container.lib.* import
@@ -416,13 +457,13 @@ class PipelineRecorder:
             ),
             patch.object(
                 pipeline_module,
-                "run_opencode_acp_impl",
-                new=AsyncMock(side_effect=self._fake_run_opencode_acp_impl),
+                "run_opencode_acp",
+                new=AsyncMock(side_effect=self._fake_run_opencode_acp),
             ),
             patch.object(
                 pipeline_module,
-                "scan_and_strip_credentials_impl",
-                side_effect=self._fake_scan_and_strip_credentials_impl,
+                "scan_and_strip_credentials",
+                side_effect=self._fake_scan_and_strip_credentials,
             ),
             patch.object(
                 pipeline_module,
@@ -441,6 +482,11 @@ class PipelineRecorder:
             ),
             patch.object(
                 pipeline_module,
+                "query_job_record",
+                new=AsyncMock(side_effect=self._fake_query_job_record),
+            ),
+            patch.object(
+                pipeline_module,
                 "record_metric",
                 side_effect=self._fake_record_metric,
             ),
@@ -448,6 +494,18 @@ class PipelineRecorder:
                 pipeline_module,
                 "record_histogram",
                 side_effect=self._fake_record_histogram,
+            ),
+            # ``.git/config`` snapshot/restore touch the real filesystem;
+            # record them instead.
+            patch.object(
+                pipeline_module,
+                "read_git_config",
+                side_effect=self._fake_read_git_config,
+            ),
+            patch.object(
+                pipeline_module,
+                "restore_git_config",
+                side_effect=self._fake_restore_git_config,
             ),
             # The pipeline body invokes ``subprocess.run`` inline for
             # ``git config user.email`` / ``git config user.name`` /
@@ -512,7 +570,8 @@ __all__ = [
 #
 #   * identical ordered sequences of step-function invocations
 #     (``resolve_git_credential``, ``git_clone``,
-#     ``run_opencode_acp_impl``, ``scan_and_strip_credentials_impl``,
+#     ``run_opencode_acp``, ``scan_and_strip_credentials``,
+#     the pre-push ``query_job_record`` status re-read,
 #     ``git_push_and_create_pr``), and
 #   * the DynamoDB transition ``RUNNING -> COMPLETE``.
 #
@@ -526,8 +585,12 @@ __all__ = [
 _EXPECTED_STEP_ORDER: list[str] = [
     "resolve_git_credential",
     "git_clone",
-    "run_opencode_acp_impl",
-    "scan_and_strip_credentials_impl",
+    "run_opencode_acp",
+    "scan_and_strip_credentials",
+    # Cross-session cancellation guard: the job record is re-read right
+    # after cancel check-point 5 and before the push (see
+    # ``container.pipeline._ensure_still_running``).
+    "query_job_record",
     "git_push_and_create_pr",
 ]
 
@@ -859,8 +922,8 @@ async def test_property_2_callback_isolation_no_progress_when_on_progress_is_non
 #
 #   1. Before ``resolve_git_credential``.
 #   2. Before ``git_clone`` + ``git config`` + ``git checkout -b``.
-#   3. Before ``run_opencode_acp_impl``.
-#   4. Before ``scan_and_strip_credentials_impl``.
+#   3. Before ``run_opencode_acp``.
+#   4. Before ``scan_and_strip_credentials``.
 #   5. Before ``git_push_and_create_pr``.
 #
 # So when ``cancel_flag()`` first returns ``True`` at the ``k``-th
@@ -1301,16 +1364,18 @@ async def test_property_4_oauth_error_classification(
             f"[confirmed_valid_retry] expected on_oauth_needed called "
             f"exactly once, got {len(oauth_calls)}: {oauth_calls!r}"
         )
-        # All five Step_Functions ran in order. Note that
-        # resolve_git_credential ran twice, so total step_calls is 6
-        # (retry + 4 other steps).
+        # All five Step_Functions ran in order (plus the pre-push
+        # ``query_job_record`` re-read). Note that resolve_git_credential
+        # ran twice, so total step_calls is 7 (retry + 4 other steps +
+        # the status re-read).
         observed_step_names = [call.name for call in recorder.step_calls]
         assert observed_step_names == [
             "resolve_git_credential",
             "resolve_git_credential",
             "git_clone",
-            "run_opencode_acp_impl",
-            "scan_and_strip_credentials_impl",
+            "run_opencode_acp",
+            "scan_and_strip_credentials",
+            "query_job_record",
             "git_push_and_create_pr",
         ], (
             f"[confirmed_valid_retry] step call sequence did not match "

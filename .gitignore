@@ -17,8 +17,10 @@ ENV/
 cdk.out*/
 cdk.context.json
 
-# Kiro
+# Kiro / agent working files
 .kiro/
+.agents/
+.worktrees/
 
 # IDE
 .vscode/

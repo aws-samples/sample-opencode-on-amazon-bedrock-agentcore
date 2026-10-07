@@ -26,6 +26,7 @@ sys.modules.setdefault("fastmcp", fastmcp_mock)
 
 # Now safe to import — unified server after runtime consolidation (spec 13)
 from container.code_mcp_server import cancel_task, get_task_status, list_tasks
+from container.lib.dynamodb_helpers import JOB_PUBLIC_FIELDS
 
 
 # ---------------------------------------------------------------------------
@@ -247,9 +248,15 @@ class TestListTasksUserScopingAndSchema:
         assert isinstance(result["jobs"], list)
         assert isinstance(result["count"], int)
 
-        # All returned jobs belong to the target user
+        # All returned jobs belong to the target user. user_id is an
+        # internal attribute that list_tasks no longer exposes, so compare
+        # by job_id against the raw records returned for the target user,
+        # and verify every job has exactly the public record shape.
+        expected_ids = [j["job_id"] for j in returned_jobs]
+        assert [j["job_id"] for j in result["jobs"]] == expected_ids
         for job in result["jobs"]:
-            assert job["user_id"] == target_user
+            assert tuple(job.keys()) == JOB_PUBLIC_FIELDS
+            assert "user_id" not in job
 
         # Count must not exceed min(limit, 100)
         assert result["count"] <= effective_limit
@@ -585,7 +592,9 @@ class TestCancelTaskTerminalStateRejection:
 # ===========================================================================
 class TestCancelTaskStopRuntimeSessionResilience:
     """For any RUNNING job, when StopRuntimeSession raises an exception,
-    cancel_task still updates DynamoDB to CANCELLED and returns success.
+    cancel_task never propagates it: it returns an honest ``cancel_failed``
+    response (status stays RUNNING) and leaves DynamoDB untouched, because
+    nothing was actually stopped.
     """
 
     # Strategy for a RUNNING job record with a session ID
@@ -628,11 +637,12 @@ class TestCancelTaskStopRuntimeSessionResilience:
     @given(record=running_job_st, exc=exception_st)
     @settings(max_examples=100)
     @pytest.mark.asyncio
-    async def test_returns_success_despite_stop_session_failure(self, record, exc):
+    async def test_returns_cancel_failed_on_stop_session_failure(self, record, exc):
         """**Validates: Requirements 3.4**
 
         For any RUNNING job, when StopRuntimeSession raises an exception,
-        cancel_task returns a response containing job_id and status "CANCELLED".
+        cancel_task does not raise and returns ``cancel_failed`` with the
+        job_id, the unchanged status RUNNING, and a detail naming the error.
         """
         job_id = record["job_id"]
         user_id = record["user_id"]
@@ -661,18 +671,20 @@ class TestCancelTaskStopRuntimeSessionResilience:
         ):
             result = await cancel_task(job_id=job_id, _user_id=user_id)
 
-        # Must return success with job_id and CANCELLED status
+        # Honest failure: nothing was stopped, so status is NOT CANCELLED.
         assert result["job_id"] == job_id
-        assert result["status"] == "CANCELLED"
+        assert result["status"] == "RUNNING"
+        assert result["error"] == "cancel_failed"
+        assert f"StopRuntimeSession failed: {type(exc).__name__}: {exc}" in result["detail"]
 
     @given(record=running_job_st, exc=exception_st)
     @settings(max_examples=100)
     @pytest.mark.asyncio
-    async def test_update_job_status_called_despite_stop_session_failure(self, record, exc):
+    async def test_update_job_status_not_called_on_stop_session_failure(self, record, exc):
         """**Validates: Requirements 3.4**
 
         For any RUNNING job, when StopRuntimeSession raises an exception,
-        cancel_task still calls update_job_status with status="CANCELLED".
+        cancel_task must NOT write to DynamoDB (the job may still be running).
         """
         job_id = record["job_id"]
         user_id = record["user_id"]
@@ -703,8 +715,5 @@ class TestCancelTaskStopRuntimeSessionResilience:
         ):
             await cancel_task(job_id=job_id, _user_id=user_id)
 
-        # update_job_status must be called with status="CANCELLED"
-        assert len(captured_updates) == 1
-        assert captured_updates[0]["job_id"] == job_id
-        assert captured_updates[0]["user_id"] == user_id
-        assert captured_updates[0]["status"] == "CANCELLED"
+        # Nothing was stopped -> nothing is written.
+        assert captured_updates == []

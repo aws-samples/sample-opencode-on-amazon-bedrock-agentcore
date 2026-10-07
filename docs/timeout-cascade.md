@@ -27,9 +27,9 @@ The Gateway is a managed AgentCore resource. Its idle timeout governs how long a
 | Setting | Value |
 |---------|-------|
 | Session lifetime | Managed by AgentCore Runtime service |
-| Session storage | `/mnt/session` (managed filesystem) |
+| Session storage | `/mnt/session` managed mount (`us-east-1` by default); work directories default to `/tmp/opencode-sessions` |
 
-The Runtime is a managed AgentCore microVM. Session lifetime is controlled by the AgentCore service. The Runtime hosts a FastMCP Python server on port 8000 that processes MCP requests. There is no explicit session timeout configured in CDK -- the service manages microVM lifecycle, including stop/resume with persistent session storage.
+The Runtime is a managed AgentCore microVM. Session lifetime is controlled by the AgentCore service. The Runtime hosts a FastMCP Python server on port 8000 that processes MCP requests. No session lifecycle (idle timeout / maximum lifetime) is configured today, so the service defaults apply; adding `LifecycleConfiguration` to the Runtime ([`AWS::BedrockAgentCore::Runtime`](https://docs.aws.amazon.com/AWSCloudFormation/latest/TemplateReference/aws-resource-bedrockagentcore-runtime.html)) is a deferred follow-up.
 
 ### 3. Interceptor Lambda Timeout
 
@@ -38,7 +38,7 @@ The Runtime is a managed AgentCore microVM. Session lifetime is controlled by th
 | Lambda timeout | **5 seconds** | `gateway_stack.py`: `timeout=cdk.Duration.seconds(5)` |
 | Memory | 128 MB | `gateway_stack.py` |
 
-The Interceptor is a REQUEST Lambda that extracts `user_id` from the JWT and injects it into tool call arguments. It runs on every inbound request before the request reaches the Runtime. The 5-second timeout is generous for this lightweight operation (base64 decode + JSON parse), which typically completes in under 100ms.
+The Interceptor is a REQUEST Lambda that extracts `user_id` from the JWT `sub` claim and injects it into tool call arguments. It runs on every inbound request before the request reaches the Runtime. The 5-second timeout is generous for this lightweight operation (base64 decode + JSON parse), which typically completes in under 100ms.
 
 ### 4. Tool-Level Timeout (`timeout_minutes`)
 
@@ -52,11 +52,14 @@ The Interceptor is a REQUEST Lambda that extracts `user_id` from the JWT and inj
 
 The tool-level timeout controls how long the OpenCode subprocess is allowed to run for a single coding task. When the timeout expires:
 
-1. The container's Python code sends **SIGTERM** to the OpenCode process (via `_terminate_process()` in `run_opencode_acp.py`)
+1. The container's Python code sends **SIGTERM** to OpenCode's whole process group (via `_terminate_process()` in `run_opencode_acp.py`; OpenCode is spawned with `start_new_session=True`, so it leads its own group and every process its bash tool started is in it)
 2. A **5-second grace period** allows the process to clean up
-3. If the process has not exited, the container sends **SIGKILL**
+3. If the leader has not exited, the container sends **SIGKILL** to the group
+4. Once the leader is gone, the group gets one more **SIGKILL** so a background child does not outlive the run
 
-This timeout is set per-call via the `timeout_minutes` parameter on the `code` and `run_coding_task` tools. The timeout is enforced inside the container by `run_opencode_acp_impl`, which calculates a deadline from `timeout_seconds` and raises `asyncio.TimeoutError` when the deadline is exceeded.
+Termination is signal-only: there is no exit confirmation for the rest of the group, and a descendant that started its own session with `setsid` is not covered. That is an accepted residual risk (see [THREAT-MODEL.md](THREAT-MODEL.md) RT-D): every process in the microVM already runs with the execution role, and the microVM is discarded at session end.
+
+This timeout is set per-call via the `timeout_minutes` parameter on the `code` and `run_coding_task` tools. The timeout is enforced inside the container by `run_opencode_acp`, which calculates a deadline from `timeout_seconds` and raises `asyncio.TimeoutError` when the deadline is exceeded. The same `_terminate_process()` also runs in a `finally` block after a normal exit, so the group is killed before the pipeline restores `.git/config` and scans the tree.
 
 #### Related Timeouts Inside the Container
 
@@ -78,8 +81,8 @@ The elicitation timeout applies to the OAuth consent flow in both `connect_git_h
 
 ### Tool Times Out (10--30 min)
 
-- **What happens:** The container's Python code (`run_opencode_acp_impl`) catches `asyncio.TimeoutError` and calls `_terminate_process()`, which sends SIGTERM then SIGKILL after 5s if the process hasn't exited.
-- **Effect:** The coding task is marked as `FAILED` with a timeout error. The job record in DynamoDB is updated. Any partial work (uncommitted file changes) remains in the session storage but is not pushed.
+- **What happens:** The container's Python code (`run_opencode_acp`) catches `asyncio.TimeoutError` and calls `_terminate_process()`, which sends SIGTERM to the process group, then SIGKILL after 5 s if the leader hasn't exited, then a final group SIGKILL.
+- **Effect:** The coding task is marked as `FAILED` with a timeout error. The job record in DynamoDB is updated. Any partial work (uncommitted file changes) remains in the work directory but is not pushed.
 - **Risk:** Low. The process is forcefully terminated. No orphaned compute.
 - **Likely cause:** Complex coding tasks, large repositories, or model latency.
 
@@ -88,7 +91,7 @@ The elicitation timeout applies to the OAuth consent flow in both `connect_git_h
 - **What happens:** The AgentCore service stops the microVM.
 - **Effect:** Any in-flight tool execution is terminated. The MCP connection drops. The client receives a connection error or timeout.
 - **Risk:** Medium. If a tool was mid-execution, the job status may not be updated to `FAILED`. The DynamoDB record could remain in `RUNNING` state (stale).
-- **Mitigation:** Operators can query GSI1 for `status#RUNNING` jobs and reconcile stale records.
+- **Mitigation:** The table has no cross-user index, so stale `RUNNING` rows are found per user with `list_tasks` (status filter `RUNNING`) or via a table export; `cancel_task` on a stale job marks it `CANCELLED`.
 
 ### Gateway Idle Timeout
 

@@ -23,7 +23,13 @@ from unittest.mock import MagicMock
 # ---------------------------------------------------------------------------
 _fastmcp_mock = MagicMock()
 _fastmcp_mock.FastMCP.return_value.tool.return_value = lambda fn: fn
+# ``from fastmcp.server.dependencies import get_http_headers`` needs the
+# submodules registered explicitly; outside a request context the real
+# helper returns an empty mapping, so the stub does the same.
+_fastmcp_mock.server.dependencies.get_http_headers.return_value = {}
 sys.modules["fastmcp"] = _fastmcp_mock
+sys.modules["fastmcp.server"] = _fastmcp_mock.server
+sys.modules["fastmcp.server.dependencies"] = _fastmcp_mock.server.dependencies
 
 # ---------------------------------------------------------------------------
 # Stub bedrock_agentcore

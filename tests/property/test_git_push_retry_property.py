@@ -58,6 +58,20 @@ _token = st.from_regex(r"ghp_[a-zA-Z0-9]{20,36}", fullmatch=True)
 _work_dir = st.sampled_from(["/tmp/work", "/workspace/code", "/home/user/repo"])
 
 
+def _git_subcommand(cmd):
+    """Return the git subcommand, skipping leading ``git`` and ``-c k=v`` pairs.
+
+    The tool prepends hardening flags (``-c core.hooksPath=/dev/null`` ...)
+    to every git invocation, so the subcommand is no longer at a fixed index.
+    """
+    if not cmd or cmd[0] != "git":
+        return ""
+    i = 1
+    while i < len(cmd) and cmd[i] == "-c":
+        i += 2
+    return cmd[i] if i < len(cmd) else ""
+
+
 def _make_subprocess_side_effect(*, push_fail_count: int):
     """Build a side_effect function for subprocess.run that simulates push failures.
 
@@ -75,7 +89,7 @@ def _make_subprocess_side_effect(*, push_fail_count: int):
         if cmd[0] != "git":
             return MagicMock(returncode=0, stdout="", stderr="")
 
-        subcmd = cmd[1] if len(cmd) > 1 else ""
+        subcmd = _git_subcommand(cmd)
 
         if subcmd == "add":
             return MagicMock(returncode=0, stdout="", stderr="")
@@ -159,7 +173,7 @@ class TestPushAllFailProperty:
             # Count push attempts
             push_calls = [
                 c for c in mock_run.call_args_list
-                if len(c[0]) > 0 and len(c[0][0]) > 1 and c[0][0][1] == "push"
+                if _git_subcommand(c[0][0]) == "push"
             ]
             assert len(push_calls) == 3, f"Expected 3 push attempts, got {len(push_calls)}"
 
@@ -204,11 +218,11 @@ class TestFetchRebaseBetweenRetriesProperty:
 
             fetch_calls = [
                 c for c in mock_run.call_args_list
-                if len(c[0]) > 0 and len(c[0][0]) > 1 and c[0][0][1] == "fetch"
+                if _git_subcommand(c[0][0]) == "fetch"
             ]
             rebase_calls = [
                 c for c in mock_run.call_args_list
-                if len(c[0]) > 0 and len(c[0][0]) > 1 and c[0][0][1] == "rebase"
+                if _git_subcommand(c[0][0]) == "rebase"
             ]
 
             assert len(fetch_calls) == 2, f"Expected 2 fetch calls, got {len(fetch_calls)}"
@@ -216,8 +230,8 @@ class TestFetchRebaseBetweenRetriesProperty:
 
             # Verify ordering: each fetch+rebase pair comes after a push failure
             all_git_cmds = [
-                c[0][0][1] for c in mock_run.call_args_list
-                if len(c[0]) > 0 and len(c[0][0]) > 1 and c[0][0][0] == "git"
+                _git_subcommand(c[0][0]) for c in mock_run.call_args_list
+                if len(c[0]) > 0 and c[0][0] and c[0][0][0] == "git"
             ]
 
             # Expected sequence: add, diff, commit, push, fetch, rebase, push, fetch, rebase, push
@@ -275,7 +289,7 @@ class TestPushSuccessStopsRetryProperty:
 
             push_calls = [
                 c for c in mock_run.call_args_list
-                if len(c[0]) > 0 and len(c[0][0]) > 1 and c[0][0][1] == "push"
+                if _git_subcommand(c[0][0]) == "push"
             ]
             assert len(push_calls) == succeed_on, (
                 f"Expected {succeed_on} push attempts, got {len(push_calls)}"
@@ -284,11 +298,11 @@ class TestPushSuccessStopsRetryProperty:
             # Fetch+rebase should be called (succeed_on - 1) times
             fetch_calls = [
                 c for c in mock_run.call_args_list
-                if len(c[0]) > 0 and len(c[0][0]) > 1 and c[0][0][1] == "fetch"
+                if _git_subcommand(c[0][0]) == "fetch"
             ]
             rebase_calls = [
                 c for c in mock_run.call_args_list
-                if len(c[0]) > 0 and len(c[0][0]) > 1 and c[0][0][1] == "rebase"
+                if _git_subcommand(c[0][0]) == "rebase"
             ]
             expected_rebase_count = succeed_on - 1
             assert len(fetch_calls) == expected_rebase_count, (

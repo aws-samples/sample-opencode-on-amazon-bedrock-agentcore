@@ -7,12 +7,9 @@ Validates:
 - cdk.json context values are read correctly
 - cdk-nag AwsSolutions aspect is applied
 
-Updated for spec 15 (cdk-native-gateway-target): PolicyStack is instantiated
-before GatewayStack, and GatewayStack depends on PolicyStack (dependency
-inversion so GatewayStack can reference policy_engine_arn at synth time).
-
-Updated for runtime consolidation (spec 13): ConnectGitHostStack removed,
-8 stacks instead of 9, Gateway depends on AgentCore only (not ConnectGitHost).
+Six stacks: VPC, Security, JobStore, CallbackApi, AgentCore, Gateway. The
+Cedar policy engine lives in the Gateway stack and the workload identity in
+the CallbackApi stack.
 """
 
 import json
@@ -24,11 +21,9 @@ import cdk_nag
 from stacks.vpc_stack import VpcStack
 from stacks.security_stack import SecurityStack
 from stacks.job_store_stack import JobStoreStack
+from stacks.callback_api_stack import CallbackApiStack
 from stacks.agentcore_stack import AgentCoreStack
 from stacks.gateway_stack import GatewayStack
-from stacks.policy_stack import PolicyStack
-from stacks.identity_stack import IdentityStack
-from stacks.observability_stack import ObservabilityStack
 from stacks import apply_standard_tags
 
 # ---------------------------------------------------------------------------
@@ -63,49 +58,31 @@ def _build_app(context_overrides: dict | None = None) -> cdk.App:
     )
     job_store_stack.add_dependency(security_stack)
 
+    callback_api_stack = CallbackApiStack(
+        app, "OpenCodeCallbackApi", cmk=security_stack.cmk, env=env,
+    )
+    callback_api_stack.add_dependency(security_stack)
+
     agentcore_stack = AgentCoreStack(
         app, "OpenCodeAgentCore",
         vpc=vpc_stack.vpc, cmk=security_stack.cmk,
-        callback_url="https://test.execute-api.us-east-1.amazonaws.com/callback",
+        callback_url=callback_api_stack.callback_url_value,
         env=env,
     )
     agentcore_stack.add_dependency(vpc_stack)
     agentcore_stack.add_dependency(security_stack)
-
-    identity_stack = IdentityStack(
-        app, "OpenCodeIdentity",
-        cmk=security_stack.cmk,
-        callback_url="https://test.execute-api.us-east-1.amazonaws.com/callback",
-        env=env,
-    )
-    identity_stack.add_dependency(security_stack)
-    identity_stack.add_dependency(agentcore_stack)
-
-    # Spec 15: PolicyStack is instantiated before GatewayStack so the Gateway
-    # can consume policy_engine_arn at synth time.
-    policy_stack = PolicyStack(
-        app, "OpenCodePolicy",
-        env=env,
-    )
-    policy_stack.add_dependency(security_stack)
+    agentcore_stack.add_dependency(callback_api_stack)
 
     gateway_stack = GatewayStack(
         app, "OpenCodeGateway",
         cognito_user_pool=security_stack.user_pool,
         cognito_client_id=security_stack.user_pool_client.user_pool_client_id,
         opencode_runtime=agentcore_stack.runtime,
-        policy_engine_arn=policy_stack.policy_engine.attr_policy_engine_arn,
         cmk=security_stack.cmk,
         env=env,
     )
     gateway_stack.add_dependency(security_stack)
     gateway_stack.add_dependency(agentcore_stack)
-    gateway_stack.add_dependency(policy_stack)
-
-    observability_stack = ObservabilityStack(
-        app, "OpenCodeObservability", cmk=security_stack.cmk, env=env,
-    )
-    observability_stack.add_dependency(security_stack)
 
     apply_standard_tags(app)
     cdk.Aspects.of(app).add(cdk_nag.AwsSolutionsChecks(verbose=True))
@@ -129,18 +106,16 @@ def _dep_names(stack: cdk.Stack) -> set[str]:
 
 
 # ---------------------------------------------------------------------------
-# Stack presence tests (8 stacks after consolidation)
+# Stack presence tests (6 stacks)
 # ---------------------------------------------------------------------------
 
 CORE_STACK_IDS = [
     "OpenCodeVpc",
     "OpenCodeSecurity",
     "OpenCodeJobStore",
+    "OpenCodeCallbackApi",
     "OpenCodeAgentCore",
-    "OpenCodeIdentity",
     "OpenCodeGateway",
-    "OpenCodePolicy",
-    "OpenCodeObservability",
 ]
 
 
@@ -155,14 +130,7 @@ class TestStackCreation:
 
     def test_total_stack_count(self):
         app = _build_app()
-        stacks = [s for s in app.node.children if isinstance(s, cdk.Stack)]
-        assert len(stacks) == 8
-
-    def test_no_connect_git_host_stack(self):
-        """Only the 8 expected stacks should be present."""
-        app = _build_app()
-        names = _stack_names(app)
-        assert len(names) == 8
+        assert sorted(_stack_names(app)) == sorted(CORE_STACK_IDS)
 
 
 # ---------------------------------------------------------------------------
@@ -182,11 +150,9 @@ class TestStackDependencies:
         assert "OpenCodeVpc" in deps
         assert "OpenCodeSecurity" in deps
 
-    def test_identity_depends_on_security_and_agentcore(self):
+    def test_agentcore_depends_on_callback_api(self):
         app = _build_app()
-        deps = _dep_names(_get_stack(app, "OpenCodeIdentity"))
-        assert "OpenCodeSecurity" in deps
-        assert "OpenCodeAgentCore" in deps
+        assert "OpenCodeCallbackApi" in _dep_names(_get_stack(app, "OpenCodeAgentCore"))
 
     def test_gateway_depends_on_security_and_agentcore(self):
         app = _build_app()
@@ -194,20 +160,13 @@ class TestStackDependencies:
         assert "OpenCodeSecurity" in deps
         assert "OpenCodeAgentCore" in deps
 
-    def test_gateway_depends_on_policy(self):
-        """Spec 15: GatewayStack depends on PolicyStack (dependency inversion)."""
-        app = _build_app()
-        assert "OpenCodePolicy" in _dep_names(_get_stack(app, "OpenCodeGateway"))
+    def test_gateway_has_policy_engine_in_stack(self):
+        """The Cedar policy engine is a resource of the Gateway stack."""
+        from aws_cdk import assertions
 
-    def test_policy_does_not_depend_on_gateway(self):
-        """Spec 15: PolicyStack no longer depends on GatewayStack."""
         app = _build_app()
-        assert "OpenCodeGateway" not in _dep_names(_get_stack(app, "OpenCodePolicy"))
-
-    def test_observability_depends_on_security(self):
-        app = _build_app()
-        assert "OpenCodeSecurity" in _dep_names(
-            _get_stack(app, "OpenCodeObservability"))
+        template = assertions.Template.from_stack(_get_stack(app, "OpenCodeGateway"))
+        template.resource_count_is("AWS::BedrockAgentCore::PolicyEngine", 1)
 
 
 # ---------------------------------------------------------------------------

@@ -17,15 +17,75 @@ import asyncio
 import os
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 import boto3
+from botocore.exceptions import ClientError
 
 REGION = os.environ.get("AWS_REGION", "us-east-1")
 JOB_TABLE = os.environ.get("JOB_TABLE_NAME", "opencode-jobs")
 VALID_STATES = {"RUNNING", "COMPLETE", "FAILED", "CANCELLED"}
 
+# The user-facing shape of a job record, shared by get_task_status and
+# list_tasks. Internal attributes (PK, SK, user_id, runtime_session_id)
+# are never exposed.
+JOB_PUBLIC_FIELDS = (
+    "job_id",
+    "status",
+    "task_description",
+    "repo_url",
+    "base_branch",
+    "target_branch",
+    "pr_url",
+    "stop_reason",
+    "files_edited",
+    "duration_seconds",
+    "error",
+    "created_at",
+    "completed_at",
+)
+
 _ddb = None
+
+
+def _decimal_to_number(value: Any) -> Any:
+    """Convert a DynamoDB ``Decimal`` to ``int`` (if integral) or ``float``."""
+    if isinstance(value, Decimal):
+        return int(value) if value == value.to_integral_value() else float(value)
+    return value
+
+
+def serialize_job_record(record: Mapping[str, Any]) -> dict:
+    """Project a raw DynamoDB job item onto :data:`JOB_PUBLIC_FIELDS`.
+
+    Returns exactly those keys, in that order. Missing string fields
+    default to ``""``, ``files_edited`` to ``[]`` and ``duration_seconds``
+    to ``0``. ``duration_seconds`` is converted from ``Decimal`` so it
+    serialises as a JSON number rather than a string. Unknown keys and
+    internal attributes are dropped.
+    """
+    out: dict[str, Any] = {}
+    for key in JOB_PUBLIC_FIELDS:
+        if key == "files_edited":
+            value = record.get(key)
+            out[key] = list(value) if value is not None else []
+        elif key == "duration_seconds":
+            value = record.get(key)
+            out[key] = _decimal_to_number(value) if value is not None else 0
+        else:
+            value = record.get(key)
+            out[key] = value if value is not None else ""
+    return out
+
+
+def serialize_job_list(items: list) -> list[dict]:
+    """Apply :func:`serialize_job_record` to every item in ``items``."""
+    return [serialize_job_record(item) for item in items]
+
+
+class JobStateConflict(Exception):
+    """Raised when a conditional status update finds the job already left
+    the expected status (e.g. COMPLETE racing against CANCELLED)."""
 
 
 def _get_ddb():
@@ -66,8 +126,6 @@ async def write_job_record(
             "target_branch": target_branch,
             "runtime_session_id": runtime_session_id,
             "created_at": now,
-            "GSI1PK": f"status#{status}",
-            "GSI1SK": now,
         },
     )
 
@@ -76,12 +134,21 @@ async def update_job_status(
     job_id: str,
     user_id: str,
     status: str,
+    *,
+    expected_status: Optional[str] = "RUNNING",
     **extra: Any,
 ) -> None:
     """Update a job record's status with optional extra attributes.
 
     Finds the record by querying PK=user#{user_id} and filtering on job_id,
     then applies an update_item call.
+
+    When ``expected_status`` is not ``None`` (default ``"RUNNING"``) the
+    update is conditional on the stored status still being that value, so
+    a terminal write can never overwrite another terminal write (e.g. a
+    late COMPLETE racing against CANCELLED). If the condition fails,
+    :class:`JobStateConflict` is raised and nothing is written. Pass
+    ``expected_status=None`` for an unconditional update.
 
     Supported extra keys: pr_url, error, stop_reason,
     files_edited, duration_seconds, completed_at.
@@ -108,9 +175,9 @@ async def update_job_status(
     sk = items[0]["SK"]
 
     # Build the update expression dynamically.
-    update_parts = ["#st = :status", "#gsi1pk = :gsi1pk"]
-    attr_names: dict[str, str] = {"#st": "status", "#gsi1pk": "GSI1PK"}
-    attr_values: dict[str, Any] = {":status": status, ":gsi1pk": f"status#{status}"}
+    update_parts = ["#st = :status"]
+    attr_names: dict[str, str] = {"#st": "status"}
+    attr_values: dict[str, Any] = {":status": status}
 
     allowed_extras = {
         "pr_url", "error", "stop_reason",
@@ -127,13 +194,25 @@ async def update_job_status(
             attr_names[alias] = key
             attr_values[placeholder] = value
 
-    await asyncio.to_thread(
-        table.update_item,
-        Key={"PK": f"user#{user_id}", "SK": sk},
-        UpdateExpression="SET " + ", ".join(update_parts),
-        ExpressionAttributeNames=attr_names,
-        ExpressionAttributeValues=attr_values,
-    )
+    update_kwargs: dict[str, Any] = {
+        "Key": {"PK": f"user#{user_id}", "SK": sk},
+        "UpdateExpression": "SET " + ", ".join(update_parts),
+        "ExpressionAttributeNames": attr_names,
+        "ExpressionAttributeValues": attr_values,
+    }
+    if expected_status is not None:
+        # Reuse the existing '#st' alias for the status attribute.
+        update_kwargs["ConditionExpression"] = "#st = :expected"
+        attr_values[":expected"] = expected_status
+
+    try:
+        await asyncio.to_thread(table.update_item, **update_kwargs)
+    except ClientError as err:
+        if err.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            raise JobStateConflict(
+                f"Job {job_id} is no longer {expected_status}"
+            ) from err
+        raise
 
 
 async def query_job_record(job_id: str, user_id: str) -> Optional[dict]:

@@ -4,8 +4,10 @@
 
 Validates: Requirements 7.2, 7.3, 10.3, 10.4
 - No S3 artifact bucket exists (removed as unused — Requirement 7)
-- Security group rules match design (outbound 443 only, no inbound from 0.0.0.0/0)
-- IAM execution role has least-privilege permissions
+- Security group rules match design (outbound TCP 443 only, no inbound at all)
+- IAM execution role has least-privilege permissions; no sts:AssumeRole
+- Every remaining IAM wildcard is described by the AwsSolutions-IAM5 reason
+- cdk-nag AwsSolutions reports no unsuppressed errors on the stack
 """
 
 import json
@@ -13,6 +15,7 @@ from pathlib import Path
 
 import aws_cdk as cdk
 from aws_cdk import assertions
+import cdk_nag
 import pytest
 
 from stacks.vpc_stack import VpcStack
@@ -31,21 +34,30 @@ def _load_cdk_context() -> dict:
         return json.load(f)["context"]
 
 
-def _build_agentcore_template(
+def _build_agentcore_app_and_stack(
     context_overrides: dict | None = None,
-) -> assertions.Template:
+    with_nag: bool = False,
+) -> AgentCoreStack:
     ctx = _load_cdk_context()
     if context_overrides:
         ctx.update(context_overrides)
     app = cdk.App(context=ctx)
+    if with_nag:
+        cdk.Aspects.of(app).add(cdk_nag.AwsSolutionsChecks())
     env = cdk.Environment(account="123456789012", region="us-east-1")
     security_stack = SecurityStack(app, "TestSecurity", env=env)
     vpc_stack = VpcStack(app, "TestVpc", cmk=security_stack.cmk, env=env)
-    stack = AgentCoreStack(
+    return AgentCoreStack(
         app, "TestAgentCore", vpc=vpc_stack.vpc, cmk=security_stack.cmk,
         callback_url="https://test.execute-api.us-east-1.amazonaws.com/callback",
         env=env,
     )
+
+
+def _build_agentcore_template(
+    context_overrides: dict | None = None,
+) -> assertions.Template:
+    stack = _build_agentcore_app_and_stack(context_overrides)
     return assertions.Template.from_stack(stack)
 
 
@@ -95,57 +107,53 @@ class TestSecurityGroup:
             {"GroupDescription": "AgentCore container security group"},
         )
 
-    def test_egress_allows_outbound_to_internet(self):
-        """Outbound rules allow egress to 0.0.0.0/0.
+    def test_egress_is_exactly_https_443_ipv4(self):
+        """The only egress rule is TCP 443 to 0.0.0.0/0 (IPv4).
 
-        The SG uses ``allow_all_outbound=True`` which CDK lowers to a
-        single ``IpProtocol: -1`` rule to ``0.0.0.0/0`` on the
-        SecurityGroup's inline ``SecurityGroupEgress`` block (not as a
-        separate egress resource). OpenCode needs outbound for Bedrock
-        (443), git over HTTPS (443), GitHub API (443), S3 (443 via
-        Gateway endpoint if present), and models.dev metadata.
+        OpenCode needs outbound HTTPS for VPC interface endpoints (Bedrock,
+        AgentCore, ECR, Logs, X-Ray, ...), the S3/DynamoDB gateway endpoints,
+        and git hosts via the NAT Gateway. The VPC is IPv4-only, so there is
+        no ``::/0`` rule.
         """
         template = _build_agentcore_template()
         tpl = template.to_json()
-        found = False
-        for lid, res in tpl["Resources"].items():
-            if res["Type"] != "AWS::EC2::SecurityGroup":
-                continue
-            egress = res.get("Properties", {}).get("SecurityGroupEgress", [])
-            for rule in egress:
-                if (
-                    rule.get("CidrIp") == "0.0.0.0/0"
-                    and rule.get("IpProtocol") in ("-1", "tcp")
-                ):
-                    found = True
-                    break
-        assert found, "No egress rule to 0.0.0.0/0 found on AgentCore SG"
+        sg = _agentcore_sg(tpl)
+        egress = sg.get("Properties", {}).get("SecurityGroupEgress", [])
+        assert len(egress) == 1, f"Expected exactly one egress rule, got {egress}"
+        rule = egress[0]
+        assert rule.get("IpProtocol") == "tcp", rule
+        assert rule.get("FromPort") == 443, rule
+        assert rule.get("ToPort") == 443, rule
+        assert rule.get("CidrIp") == "0.0.0.0/0", rule
+        assert "CidrIpv6" not in rule, rule
+        # No egress rules hiding outside the inline block.
+        template.resource_count_is("AWS::EC2::SecurityGroupEgress", 0)
 
     def test_no_allow_all_outbound(self):
-        """Security group does not have allow_all_outbound (no 0.0.0.0/0 on all ports)."""
+        """No all-traffic egress rule (inline or standalone), and no ::/0 egress."""
         template = _build_agentcore_template()
         tpl = template.to_json()
-        egress_rules = {
-            lid: res
-            for lid, res in tpl["Resources"].items()
-            if res["Type"] == "AWS::EC2::SecurityGroupEgress"
-        }
-        for lid, res in egress_rules.items():
+        rules: list[tuple[str, dict]] = []
+        for lid, res in tpl["Resources"].items():
             props = res.get("Properties", {})
-            # If there's a rule with all ports (from 0 to 65535) to 0.0.0.0/0, that's bad
-            from_port = props.get("FromPort")
-            to_port = props.get("ToPort")
-            cidr = props.get("CidrIp", "")
-            ip_protocol = props.get("IpProtocol", "")
-            if ip_protocol == "-1" and cidr == "0.0.0.0/0":
-                pytest.fail(
-                    f"Security group has allow-all outbound rule: {lid}"
-                )
+            if res["Type"] == "AWS::EC2::SecurityGroup":
+                for rule in props.get("SecurityGroupEgress", []):
+                    rules.append((lid, rule))
+            elif res["Type"] == "AWS::EC2::SecurityGroupEgress":
+                rules.append((lid, props))
+        for lid, rule in rules:
+            if str(rule.get("IpProtocol")) == "-1":
+                pytest.fail(f"Security group has allow-all outbound rule: {lid} {rule}")
+            if rule.get("CidrIpv6") == "::/0":
+                pytest.fail(f"Security group has IPv6 ::/0 egress: {lid} {rule}")
 
     def test_no_inbound_from_anywhere(self):
-        """No ingress rules from 0.0.0.0/0 — AgentCore SG is egress-only (HTTPS out)."""
+        """AgentCore SG has no ingress at all (inline or standalone)."""
         template = _build_agentcore_template()
         tpl = template.to_json()
+        sg = _agentcore_sg(tpl)
+        inline_ingress = sg.get("Properties", {}).get("SecurityGroupIngress", [])
+        assert not inline_ingress, f"AgentCore SG has ingress rules: {inline_ingress}"
         ingress_rules = {
             lid: res
             for lid, res in tpl["Resources"].items()
@@ -154,9 +162,9 @@ class TestSecurityGroup:
         for lid, res in ingress_rules.items():
             props = res.get("Properties", {})
             cidr = props.get("CidrIp", "")
-            if cidr == "0.0.0.0/0":
+            if cidr == "0.0.0.0/0" or props.get("CidrIpv6") == "::/0":
                 pytest.fail(
-                    f"Security group has ingress from 0.0.0.0/0: {lid}"
+                    f"Security group has ingress from anywhere: {lid}"
                 )
 
 
@@ -225,12 +233,43 @@ class TestIamExecutionRole:
         assert "dynamodb:UpdateItem" in actions, "Missing dynamodb:UpdateItem"
         assert "dynamodb:Query" in actions, "Missing dynamodb:Query"
 
-    def test_policy_has_sts_assume_role(self):
-        """Role policy includes sts:AssumeRole for per-task scoped credentials."""
+    def test_no_sts_assume_role(self):
+        """No identity policy grants sts:AssumeRole (the dead self-assume statement is gone).
+
+        Only ``AWS::IAM::Policy`` resources are scanned; the role's trust
+        policy legitimately contains ``sts:AssumeRole`` for the service principal.
+        """
         template = _build_agentcore_template()
         tpl = template.to_json()
-        actions = _collect_all_policy_actions(tpl)
-        assert "sts:AssumeRole" in actions, "Missing sts:AssumeRole"
+        for lid, res in tpl["Resources"].items():
+            if res["Type"] != "AWS::IAM::Policy":
+                continue
+            doc = res.get("Properties", {}).get("PolicyDocument", {})
+            for stmt in doc.get("Statement", []):
+                assert stmt.get("Sid") != "StsAssumeRole", f"{lid}: {stmt}"
+                act = stmt.get("Action", [])
+                if isinstance(act, str):
+                    act = [act]
+                bad = {"sts:AssumeRole", "sts:*", "*"} & set(act)
+                assert not bad, f"{lid} grants {bad}: {stmt}"
+
+
+# ---------------------------------------------------------------------------
+# cdk-nag
+# ---------------------------------------------------------------------------
+
+
+class TestCdkNag:
+    """Verify the AgentCore stack has no unsuppressed AwsSolutions errors."""
+
+    def test_no_unsuppressed_cdk_nag_errors(self):
+        """No unsuppressed AwsSolutions errors; the SG needs no suppressions."""
+        stack = _build_agentcore_app_and_stack(with_nag=True)
+        # any_value() also catches CdkNagValidationFailure, not just AwsSolutions-*.
+        errors = assertions.Annotations.from_stack(stack).find_error(
+            "*", assertions.Match.any_value()
+        )
+        assert not errors, f"Unsuppressed cdk-nag errors: {errors}"
 
     def test_policy_has_cloudwatch_permissions(self):
         """Role policy includes CloudWatch Logs and Metrics actions."""
@@ -271,52 +310,54 @@ class TestIamExecutionRole:
 
 
 # ---------------------------------------------------------------------------
-# ECR Repository tests (Requirement 13.2)
+# Runtime
 # ---------------------------------------------------------------------------
 
 
-# ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
-# ECR Repository tests
-# ---------------------------------------------------------------------------
+class TestRuntime:
+    """The image is a DockerImageAsset; no stack-owned ECR repository."""
 
-
-class TestEcrRepository:
-    """Verify ECR repository for OpenCode container image."""
-
-    def test_ecr_repo_exists(self):
+    def test_no_ecr_repository(self):
         template = _build_agentcore_template()
-        template.resource_count_is("AWS::ECR::Repository", 1)
+        template.resource_count_is("AWS::ECR::Repository", 0)
 
-    def test_ecr_repo_name(self):
+    def test_runtime_env_sets_opencode_model_to_default_model_id(self):
         template = _build_agentcore_template()
+        model_id = _load_cdk_context()["default_model_id"]
+        assert model_id == "global.anthropic.claude-opus-4-6-v1"
         template.has_resource_properties(
-            "AWS::ECR::Repository",
-            {"RepositoryName": "opencode-agentcore"},
-        )
-
-    def test_ecr_repo_image_scan_on_push(self):
-        template = _build_agentcore_template()
-        template.has_resource_properties(
-            "AWS::ECR::Repository",
-            {"ImageScanningConfiguration": {"ScanOnPush": True}},
-        )
-
-    def test_ecr_repo_kms_encryption(self):
-        template = _build_agentcore_template()
-        template.has_resource_properties(
-            "AWS::ECR::Repository",
+            "AWS::BedrockAgentCore::Runtime",
             {
-                "EncryptionConfiguration": assertions.Match.object_like(
-                    {"EncryptionType": "KMS"}
+                "EnvironmentVariables": assertions.Match.object_like(
+                    {"OPENCODE_MODEL": model_id}
                 ),
             },
         )
+
+    def test_bedrock_resources_derive_from_default_model_only(self):
+        """Only the default model's foundation-model and inference-profile
+        ARNs are granted (no extra hard-coded model)."""
+        tpl = _build_agentcore_template().to_json()
+        resources = _collect_resources_for_action(tpl, "bedrock:InvokeModel")
+        flat = json.dumps(resources)
+        assert "anthropic.claude-opus-4-6-v1" in flat
+        assert "sonnet" not in flat.lower()
+        assert len(resources) == 2, resources
 
 
 # ---------------------------------------------------------------------------
 # Helpers for IAM policy inspection
 # ---------------------------------------------------------------------------
+
+
+def _agentcore_sg(tpl: dict) -> dict:
+    """Return the single AWS::EC2::SecurityGroup resource in the stack."""
+    sgs = [
+        res for res in tpl["Resources"].values()
+        if res["Type"] == "AWS::EC2::SecurityGroup"
+    ]
+    assert len(sgs) == 1, f"Expected exactly one security group, found {len(sgs)}"
+    return sgs[0]
 
 
 def _find_execution_role(tpl: dict) -> dict:

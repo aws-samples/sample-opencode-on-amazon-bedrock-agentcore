@@ -12,7 +12,7 @@ into CDK.
 The ``_build_stacks`` helper here is a deterministic analogue of the
 Hypothesis-driven harness in
 ``tests/property/test_gateway_stack_synthesis.py``. Fixed stub inputs
-(region, account, runtime id, policy engine ARN) make these tests safe
+(region, account, runtime id) make these tests safe
 to run on every unit-test invocation without relying on Hypothesis's
 example-generation layer.
 
@@ -25,7 +25,6 @@ import json
 from pathlib import Path
 
 import aws_cdk as cdk
-import pytest
 from aws_cdk import assertions
 from aws_cdk import aws_bedrockagentcore as bedrockagentcore
 from aws_cdk import aws_cognito as cognito
@@ -42,9 +41,6 @@ from stacks.gateway_stack import GatewayStack
 _REGION = "us-east-1"
 _ACCOUNT = "123456789012"
 _RUNTIME_ID = "ABCDEFGHIJ"
-_POLICY_ENGINE_ARN = (
-    f"arn:aws:bedrock-agentcore:{_REGION}:{_ACCOUNT}:policy-engine/ENGINE00001"
-)
 
 # ---------------------------------------------------------------------------
 # Context loading — match what cdk.json exposes at synth time.
@@ -59,8 +55,8 @@ def _load_cdk_context() -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Stub stacks — minimal analogues of AgentCoreStack and PolicyStack that
-# expose just the attributes ``GatewayStack`` reads at synth time.
+# Stub stack — minimal analogue of AgentCoreStack that
+# exposes just the attributes ``GatewayStack`` reads at synth time.
 # ---------------------------------------------------------------------------
 
 
@@ -97,25 +93,6 @@ class _StubAgentCoreStack(cdk.Stack):
         )
 
 
-class _StubPolicyStack(cdk.Stack):
-    """Minimal stack exposing ``policy_engine.attr_policy_engine_arn``."""
-
-    def __init__(
-        self,
-        scope: Construct,
-        construct_id: str,
-        **kwargs,
-    ) -> None:
-        super().__init__(scope, construct_id, **kwargs)
-
-        self.policy_engine = bedrockagentcore.CfnPolicyEngine(
-            self,
-            "StubPolicyEngine",
-            name="stub_policy_engine",
-            description="Stub policy engine for synthesis-level unit tests",
-        )
-
-
 # ---------------------------------------------------------------------------
 # Deterministic stack factory
 # ---------------------------------------------------------------------------
@@ -126,15 +103,8 @@ def _build_stacks(
     region: str = _REGION,
     account: str = _ACCOUNT,
     runtime_id: str = _RUNTIME_ID,
-    policy_engine_arn: str | None = _POLICY_ENGINE_ARN,
 ) -> tuple[cdk.App, GatewayStack]:
-    """Build a fresh ``cdk.App`` with stub AgentCore + Policy + real Gateway.
-
-    When ``policy_engine_arn`` is ``None``, the stub PolicyEngine's
-    ``attr_policy_engine_arn`` attribute is threaded through instead so the
-    synthesized template contains a cross-stack reference shape. Pass a
-    literal string (the default) to pin the flat resource shape.
-    """
+    """Build a fresh ``cdk.App`` with a stub AgentCore stack + real Gateway."""
     ctx = _load_cdk_context()
     app = cdk.App(context=ctx)
     env = cdk.Environment(account=account, region=region)
@@ -146,8 +116,6 @@ def _build_stacks(
         env=env,
     )
 
-    policy_stack = _StubPolicyStack(app, "StubPolicy", env=env)
-
     # Helper stack for the Cognito user pool reference — keeps the Gateway
     # stack's ``cognito_user_pool`` kwarg satisfied without standing up a
     # full SecurityStack.
@@ -156,12 +124,6 @@ def _build_stacks(
         helper_stack,
         "StubUserPool",
         f"{region}_abcdefghi",
-    )
-
-    pe_arn = (
-        policy_engine_arn
-        if policy_engine_arn is not None
-        else policy_stack.policy_engine.attr_policy_engine_arn
     )
 
     # Stub KMS key for CMK encryption
@@ -174,12 +136,10 @@ def _build_stacks(
         cognito_user_pool=user_pool,
         cognito_client_id="abcdefghijklmnopqrstuvwxyz",
         opencode_runtime=agentcore_stack.runtime,
-        policy_engine_arn=pe_arn,
         cmk=stub_cmk,
         env=env,
     )
     gateway_stack.add_dependency(agentcore_stack)
-    gateway_stack.add_dependency(policy_stack)
 
     return app, gateway_stack
 
@@ -287,49 +247,75 @@ class TestPolicyEngineConfiguration:
         assert pe_config is not None
         assert pe_config.get("Mode") == "LOG_ONLY"
 
-    def test_policy_engine_configuration_arn_matches_input(self) -> None:
+    def test_gateway_enables_response_streaming(self) -> None:
+        """Response streaming must be on so notifications/progress reach clients."""
         _app, gateway_stack = _build_stacks()
         template = assertions.Template.from_stack(gateway_stack)
         gateway = _get_single_gateway(template)
-        pe_config = gateway.get("Properties", {}).get("PolicyEngineConfiguration")
-        assert pe_config is not None
-        assert pe_config.get("Arn") == _POLICY_ENGINE_ARN
+        mcp_config = gateway.get("Properties", {}).get("ProtocolConfiguration", {}).get("Mcp")
+        assert mcp_config is not None
+        assert mcp_config.get("StreamingConfiguration", {}).get("EnableResponseStreaming") is True
+        assert mcp_config.get("SupportedVersions") == ["2025-03-26"]
+
+    def test_policy_engine_configuration_arn_is_in_stack_engine(self) -> None:
+        _app, gateway_stack = _build_stacks()
+        template = assertions.Template.from_stack(gateway_stack)
+        template.has_resource_properties(
+            "AWS::BedrockAgentCore::Gateway",
+            {
+                "PolicyEngineConfiguration": {
+                    "Arn": {
+                        "Fn::GetAtt": [
+                            assertions.Match.string_like_regexp("OpenCodePolicyEngine.*"),
+                            "PolicyEngineArn",
+                        ]
+                    },
+                    "Mode": "LOG_ONLY",
+                }
+            },
+        )
+
+    def test_gateway_depends_on_policy_engine(self) -> None:
+        _app, gateway_stack = _build_stacks()
+        template = assertions.Template.from_stack(gateway_stack)
+        tpl = template.to_json()
+        gateway_lid = next(
+            lid for lid, r in tpl["Resources"].items()
+            if r["Type"] == "AWS::BedrockAgentCore::Gateway"
+        )
+        engine_lid = next(
+            lid for lid, r in tpl["Resources"].items()
+            if r["Type"] == "AWS::BedrockAgentCore::PolicyEngine"
+        )
+        assert engine_lid in tpl["Resources"][gateway_lid].get("DependsOn", [])
 
 
 # ---------------------------------------------------------------------------
-# Task 2.3 — Unit test: missing policy_engine_arn raises TypeError
+# Cedar Policy Engine (lives in the Gateway stack)
 # ---------------------------------------------------------------------------
 
 
-class TestMissingPolicyEngineArnRaisesTypeError:
-    """Verify GatewayStack fails fast when policy_engine_arn is omitted."""
+class TestPolicyEngine:
+    """The Cedar policy engine and its outputs are part of the Gateway stack."""
 
-    def test_gateway_stack_rejects_missing_policy_engine_arn(self) -> None:
-        ctx = _load_cdk_context()
-        app = cdk.App(context=ctx)
-        env = cdk.Environment(account=_ACCOUNT, region=_REGION)
-
-        agentcore_stack = _StubAgentCoreStack(
-            app, "StubAgentCore", runtime_id=_RUNTIME_ID, env=env,
+    def test_policy_engine_exists_with_name(self) -> None:
+        _app, gateway_stack = _build_stacks()
+        template = assertions.Template.from_stack(gateway_stack)
+        template.resource_count_is("AWS::BedrockAgentCore::PolicyEngine", 1)
+        template.has_resource_properties(
+            "AWS::BedrockAgentCore::PolicyEngine",
+            {
+                "Name": "opencode_policy_engine",
+                "Description": assertions.Match.string_like_regexp(".*Cedar.*policy.*"),
+            },
         )
-        helper_stack = cdk.Stack(app, "HelperStack", env=env)
-        user_pool = cognito.UserPool.from_user_pool_id(
-            helper_stack, "StubUserPool", f"{_REGION}_abcdefghi",
-        )
-        cmk_stack = cdk.Stack(app, "StubCmkStack", env=env)
-        stub_cmk = kms.Key(cmk_stack, "StubCmk")
 
-        with pytest.raises(TypeError):
-            GatewayStack(
-                app,
-                "OpenCodeGateway",
-                cognito_user_pool=user_pool,
-                cognito_client_id="abcdefghijklmnopqrstuvwxyz",
-                opencode_runtime=agentcore_stack.runtime,
-                cmk=stub_cmk,
-                # policy_engine_arn intentionally omitted
-                env=env,
-            )
+    def test_policy_engine_outputs(self) -> None:
+        _app, gateway_stack = _build_stacks()
+        tpl = assertions.Template.from_stack(gateway_stack).to_json()
+        outputs = tpl.get("Outputs", {})
+        for key in ("PolicyEngineId", "PolicyEngineArn", "GatewayArn", "GatewayId", "GatewayUrl"):
+            assert key in outputs, key
 
 
 # ---------------------------------------------------------------------------

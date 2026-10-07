@@ -58,23 +58,88 @@ class TestGetRuntimeArn:
         assert result == "arn:aws:bedrock-agentcore:us-east-1:123:runtime/rt-abc123"
 
     def test_returns_empty_when_nothing_set(self):
-        """_get_runtime_arn() returns '' when no env vars are set.
+        """_get_runtime_arn() returns '' (and never calls AWS) when no env
+        vars are set, including RUNTIME_NAME.
 
         Validates: Requirements 3.3
         """
-        with patch.dict(
-            "os.environ",
-            {
-                "RUNTIME_ARN": "",
-                "OPENCODE_RUNTIME_ARN": "",
-                "RUNTIME_ARN_PREFIX": "",
-                "AGENT_RUNTIME_ID": "",
-            },
-            clear=False,
+        with (
+            patch.dict(
+                "os.environ",
+                {
+                    "RUNTIME_ARN": "",
+                    "OPENCODE_RUNTIME_ARN": "",
+                    "RUNTIME_ARN_PREFIX": "",
+                    "AGENT_RUNTIME_ID": "",
+                    "RUNTIME_NAME": "",
+                },
+                clear=False,
+            ),
+            patch("container.code_mcp_server.boto3.client") as mock_client,
         ):
             result = _get_runtime_arn()
 
         assert result == ""
+        mock_client.assert_not_called()
+
+    def test_discovers_arn_by_runtime_name(self):
+        """With only RUNTIME_NAME set, the ARN is discovered via
+        ListAgentRuntimes and cached for subsequent calls.
+        """
+        import container.code_mcp_server as server
+
+        paginator = MagicMock()
+        paginator.paginate.return_value = [
+            {"agentRuntimes": [
+                {"agentRuntimeName": "other", "agentRuntimeArn": "arn:other"},
+            ]},
+            {"agentRuntimes": [
+                {"agentRuntimeName": "opencode_runtime",
+                 "agentRuntimeArn": "arn:aws:bedrock-agentcore:eu-central-1:123:runtime/rt-x"},
+            ]},
+        ]
+        client = MagicMock()
+        client.get_paginator.return_value = paginator
+        env = {
+            "RUNTIME_ARN": "",
+            "OPENCODE_RUNTIME_ARN": "",
+            "RUNTIME_ARN_PREFIX": "",
+            "AGENT_RUNTIME_ID": "",
+            "RUNTIME_NAME": "opencode_runtime",
+        }
+        with (
+            patch.dict("os.environ", env, clear=False),
+            patch.object(server, "_discovered_runtime_arn", ""),
+            patch("container.code_mcp_server.boto3.client", return_value=client) as mock_client,
+        ):
+            first = _get_runtime_arn()
+            second = _get_runtime_arn()
+
+        assert first == "arn:aws:bedrock-agentcore:eu-central-1:123:runtime/rt-x"
+        assert second == first
+        # Cached after the first discovery: only one control-plane client built.
+        assert mock_client.call_count == 1
+        client.get_paginator.assert_called_once_with("list_agent_runtimes")
+
+    def test_discovery_failure_returns_empty(self):
+        """A control-plane error during discovery yields '' instead of raising."""
+        import container.code_mcp_server as server
+
+        client = MagicMock()
+        client.get_paginator.side_effect = RuntimeError("boom")
+        env = {
+            "RUNTIME_ARN": "",
+            "OPENCODE_RUNTIME_ARN": "",
+            "RUNTIME_ARN_PREFIX": "",
+            "AGENT_RUNTIME_ID": "",
+            "RUNTIME_NAME": "opencode_runtime",
+        }
+        with (
+            patch.dict("os.environ", env, clear=False),
+            patch.object(server, "_discovered_runtime_arn", ""),
+            patch("container.code_mcp_server.boto3.client", return_value=client),
+        ):
+            assert _get_runtime_arn() == ""
 
     def test_falls_back_to_opencode_runtime_arn(self):
         """_get_runtime_arn() checks OPENCODE_RUNTIME_ARN as fallback.
@@ -124,7 +189,8 @@ class TestCancelTaskArnResolution:
     @pytest.mark.asyncio
     async def test_logs_warning_and_skips_stop_when_arn_empty(self, caplog):
         """cancel_task logs a warning and does not call StopRuntimeSession
-        when _get_runtime_arn() returns ''.
+        when _get_runtime_arn() returns ''. Nothing was stopped, so the
+        result is ``cancel_failed`` and DynamoDB is not touched.
 
         Validates: Requirements 3.4
         """
@@ -140,8 +206,10 @@ class TestCancelTaskArnResolution:
                 "runtime_session_id": session_id,
             }
 
+        update_calls = []
+
         async def mock_update(job_id, user_id, status, **kwargs):
-            pass
+            update_calls.append(status)
 
         mock_client = MagicMock()
 
@@ -176,6 +244,9 @@ class TestCancelTaskArnResolution:
             for msg in caplog.messages
         ), f"Expected warning about unresolved ARN, got: {caplog.messages}"
 
-        # Job should still be cancelled in DynamoDB
-        assert result["status"] == "CANCELLED"
+        # Nothing was stopped: honest failure, record left untouched.
+        assert result["error"] == "cancel_failed"
+        assert result["status"] == "RUNNING"
         assert result["job_id"] == job_id
+        assert "runtime ARN unresolved" in result["detail"]
+        assert update_calls == []
