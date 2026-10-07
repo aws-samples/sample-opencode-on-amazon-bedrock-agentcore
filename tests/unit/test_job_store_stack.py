@@ -3,7 +3,7 @@
 """Unit tests for Job Store stack (stacks/job_store_stack.py).
 
 Validates: Requirements 7.1, 12.1
-- Jobs table key schemas match design (PK, SK, GSI1)
+- Jobs table key schema matches design (PK, SK), no GSI
 - KMS encryption is configured
 - Point-in-time recovery is enabled
 """
@@ -95,45 +95,16 @@ class TestJobsTableKeySchema:
             },
         )
 
-    def test_jobs_table_has_one_gsi(self):
-        """Jobs table has exactly 1 GSI (GSI1)."""
+    def test_jobs_table_has_no_gsi(self):
+        """Queries are user-partitioned on the base table; no GSI exists."""
         template = _build_job_store_template()
         tpl = template.to_json()
-        tables = _get_tables(tpl)
-        gsis = tables["opencode-jobs"].get("GlobalSecondaryIndexes", [])
-        assert len(gsis) == 1, f"Expected 1 GSI, got {len(gsis)}"
-
-    def test_gsi1_key_schema(self):
-        """GSI1 PK=GSI1PK (HASH), SK=GSI1SK (RANGE)."""
-        template = _build_job_store_template()
-        template.has_resource_properties(
-            "AWS::DynamoDB::Table",
-            {
-                "TableName": "opencode-jobs",
-                "GlobalSecondaryIndexes": assertions.Match.array_with([
-                    assertions.Match.object_like({
-                        "IndexName": "GSI1",
-                        "KeySchema": assertions.Match.array_with([
-                            assertions.Match.object_like({"AttributeName": "GSI1PK", "KeyType": "HASH"}),
-                            assertions.Match.object_like({"AttributeName": "GSI1SK", "KeyType": "RANGE"}),
-                        ]),
-                    }),
-                ]),
-            },
+        table = next(
+            r for r in tpl["Resources"].values()
+            if r["Type"] == "AWS::DynamoDB::Table"
         )
+        assert "GlobalSecondaryIndexes" not in table["Properties"]
 
-    def test_gsi1_projection_includes_expected_attributes(self):
-        """GSI1 projects: job_id, user_id, repo_url, created_at."""
-        template = _build_job_store_template()
-        tpl = template.to_json()
-        tables = _get_tables(tpl)
-        gsis = tables["opencode-jobs"]["GlobalSecondaryIndexes"]
-        gsi1 = next(g for g in gsis if g["IndexName"] == "GSI1")
-        projection = gsi1["Projection"]
-        assert projection["ProjectionType"] == "INCLUDE"
-        expected = {"job_id", "user_id", "repo_url", "created_at"}
-        actual = set(projection.get("NonKeyAttributes", []))
-        assert expected == actual, f"GSI1 projection mismatch: expected {expected}, got {actual}"
 
 
 # ---------------------------------------------------------------------------
@@ -204,114 +175,11 @@ class TestTableBasics:
 
 
 # ---------------------------------------------------------------------------
-# CloudWatch alarm tests (Requirement 2.1, 2.2, 2.3, 2.4 — GSI1 throttling)
+# No alarms / topics
 # ---------------------------------------------------------------------------
 
-class TestGSI1ThrottleAlarm:
-    """Verify CloudWatch alarm for GSI1 throttled requests."""
-
-    def test_alarm_resource_exists(self):
-        """Template contains a CloudWatch alarm."""
+class TestNoSnsOrAlarms:
+    def test_no_sns_or_alarms(self):
         template = _build_job_store_template()
-        template.resource_count_is("AWS::CloudWatch::Alarm", 1)
-
-    def test_alarm_metric_name(self):
-        """Alarm uses ThrottledRequests metric."""
-        template = _build_job_store_template()
-        template.has_resource_properties(
-            "AWS::CloudWatch::Alarm",
-            {"MetricName": "ThrottledRequests"},
-        )
-
-    def test_alarm_namespace(self):
-        """Alarm uses AWS/DynamoDB namespace."""
-        template = _build_job_store_template()
-        template.has_resource_properties(
-            "AWS::CloudWatch::Alarm",
-            {"Namespace": "AWS/DynamoDB"},
-        )
-
-    def test_alarm_threshold_and_comparison(self):
-        """Alarm threshold is 0 with GREATER_THAN comparison."""
-        template = _build_job_store_template()
-        template.has_resource_properties(
-            "AWS::CloudWatch::Alarm",
-            {
-                "Threshold": 0,
-                "ComparisonOperator": "GreaterThanThreshold",
-            },
-        )
-
-    def test_alarm_evaluation_period_and_period(self):
-        """Alarm evaluates 1 period of 300 seconds."""
-        template = _build_job_store_template()
-        template.has_resource_properties(
-            "AWS::CloudWatch::Alarm",
-            {
-                "EvaluationPeriods": 1,
-                "Period": 300,
-            },
-        )
-
-    def test_alarm_dimensions_include_table_and_gsi(self):
-        """Alarm dimensions include TableName and GlobalSecondaryIndexName."""
-        template = _build_job_store_template()
-        template.has_resource_properties(
-            "AWS::CloudWatch::Alarm",
-            {
-                "Dimensions": assertions.Match.array_with([
-                    assertions.Match.object_like({
-                        "Name": "GlobalSecondaryIndexName",
-                        "Value": "GSI1",
-                    }),
-                ]),
-            },
-        )
-        # TableName dimension uses a Ref; just verify it's present by name.
-        template.has_resource_properties(
-            "AWS::CloudWatch::Alarm",
-            {
-                "Dimensions": assertions.Match.array_with([
-                    assertions.Match.object_like({"Name": "TableName"}),
-                ]),
-            },
-        )
-
-    def test_alarm_has_sns_action(self):
-        """Alarm has at least one alarm action (SNS topic)."""
-        template = _build_job_store_template()
-        template.has_resource_properties(
-            "AWS::CloudWatch::Alarm",
-            {
-                "AlarmActions": assertions.Match.any_value(),
-            },
-        )
-
-
-# ---------------------------------------------------------------------------
-# SNS topic tests (Requirement 2.3 — operational alerts)
-# ---------------------------------------------------------------------------
-
-class TestOpsAlertsTopic:
-    """Verify SNS topic for operational alerts."""
-
-    def test_sns_topic_exists(self):
-        """Template contains an SNS topic."""
-        template = _build_job_store_template()
-        template.resource_count_is("AWS::SNS::Topic", 1)
-
-    def test_sns_topic_name(self):
-        """SNS topic is named opencode-ops-alerts."""
-        template = _build_job_store_template()
-        template.has_resource_properties(
-            "AWS::SNS::Topic",
-            {"TopicName": "opencode-ops-alerts"},
-        )
-
-    def test_sns_topic_arn_output(self):
-        """Stack exports the SNS topic ARN."""
-        template = _build_job_store_template()
-        template.has_output(
-            "OpsAlertsTopicArn",
-            {"Description": "SNS topic ARN for operational alerts"},
-        )
+        template.resource_count_is("AWS::SNS::Topic", 0)
+        template.resource_count_is("AWS::CloudWatch::Alarm", 0)

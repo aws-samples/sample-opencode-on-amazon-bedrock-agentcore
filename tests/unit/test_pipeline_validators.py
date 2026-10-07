@@ -33,7 +33,6 @@ class TestValidateRepoUrl:
             "https://github.com/owner/repo",
             "https://github.com/owner/repo.git",
             "https://gitlab.example.com/group/project.git",
-            "git@github.com:owner/repo.git",
             "https://github.com/owner/" + "a" * 100,
             # Non-ASCII path segments are allowed (git lets them through).
             "https://github.com/owner/ŀÙ𭂃",
@@ -48,6 +47,8 @@ class TestValidateRepoUrl:
             "",
             "http://github.com/owner/repo",          # plain http not allowed
             "ftp://github.com/owner/repo",           # wrong scheme
+            "git@github.com:owner/repo.git",         # SSH not allowed (HTTPS-only)
+            "ssh://git@github.com/owner/repo.git",   # SSH scheme not allowed
             "github.com/owner/repo",                 # missing scheme
             "https:/typo.com/x",                     # malformed scheme
             "https://github.com/owner/repo\x00hi",   # NUL

@@ -10,8 +10,10 @@ Requirements: 6.2, 6.3, 6.4, 20.1
 
 from __future__ import annotations
 
+import json
 import sys
 import uuid
+from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -36,7 +38,10 @@ from container.code_mcp_server import (  # noqa: E402
     list_tasks,
     get_task_status,
 )
-from container.lib.dynamodb_helpers import query_user_jobs  # noqa: E402
+from container.lib.dynamodb_helpers import (  # noqa: E402
+    JOB_PUBLIC_FIELDS,
+    query_user_jobs,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -44,7 +49,9 @@ from container.lib.dynamodb_helpers import query_user_jobs  # noqa: E402
 # ---------------------------------------------------------------------------
 _FAKE_JOBS_USER_A = [
     {"PK": "user#alice", "SK": f"job#{uuid.uuid4()}#2025-01-01T00:00:00+00:00",
-     "job_id": str(uuid.uuid4()), "status": "COMPLETE", "user_id": "alice"},
+     "job_id": str(uuid.uuid4()), "status": "COMPLETE", "user_id": "alice",
+     "runtime_session_id": "sess-a", "duration_seconds": Decimal("173.52"),
+     "files_edited": ["README.md"]},
     {"PK": "user#alice", "SK": f"job#{uuid.uuid4()}#2025-01-02T00:00:00+00:00",
      "job_id": str(uuid.uuid4()), "status": "RUNNING", "user_id": "alice"},
     {"PK": "user#alice", "SK": f"job#{uuid.uuid4()}#2025-01-03T00:00:00+00:00",
@@ -141,9 +148,61 @@ class TestListTasks:
             mock_ddb.return_value.Table.return_value = mock_table
             result = await list_tasks(_user_id="alice")
 
-        # All returned jobs belong to alice
+        # All returned jobs belong to alice (user_id itself is no longer
+        # exposed, so compare against the raw fixture by job_id).
+        alice_ids = {j["job_id"] for j in _FAKE_JOBS_USER_A}
+        bob_ids = {j["job_id"] for j in _FAKE_JOBS_USER_B}
+        returned = {j["job_id"] for j in result["jobs"]}
+        assert returned == alice_ids
+        assert not (returned & bob_ids)
+
+    @pytest.mark.asyncio
+    async def test_jobs_are_serialized_public_shape(self):
+        """list_tasks returns the same public shape as get_task_status:
+        no PK/SK/user_id/runtime_session_id, Decimal converted to a
+        JSON number, missing fields defaulted."""
+        mock_table = MagicMock()
+        mock_table.query = _mock_query_for_user("alice")
+
+        with patch("container.lib.dynamodb_helpers._get_ddb") as mock_ddb:
+            mock_ddb.return_value.Table.return_value = mock_table
+            result = await list_tasks(_user_id="alice")
+
+        assert set(result.keys()) == {"jobs", "count"}
         for job in result["jobs"]:
-            assert job["user_id"] == "alice"
+            assert tuple(job.keys()) == JOB_PUBLIC_FIELDS
+            for hidden in ("PK", "SK", "user_id", "runtime_session_id"):
+                assert hidden not in job
+            assert isinstance(job["duration_seconds"], (int, float))
+            assert isinstance(job["files_edited"], list)
+
+        complete = next(j for j in result["jobs"] if j["status"] == "COMPLETE")
+        assert complete["duration_seconds"] == 173.52
+        assert complete["files_edited"] == ["README.md"]
+        # No Decimal leaks: the whole response is JSON-serialisable as-is.
+        assert json.loads(json.dumps(result))["jobs"][0]["duration_seconds"] in (173.52, 0)
+
+    @pytest.mark.asyncio
+    async def test_list_and_status_share_record_shape(self):
+        """A job seen through list_tasks and through get_task_status has an
+        identical key set."""
+        raw = _FAKE_JOBS_USER_A[0]
+        mock_table = MagicMock()
+        mock_table.query = _mock_query_for_user("alice")
+
+        with patch("container.lib.dynamodb_helpers._get_ddb") as mock_ddb:
+            mock_ddb.return_value.Table.return_value = mock_table
+            listed = await list_tasks(status="COMPLETE", _user_id="alice")
+
+        with patch(
+            "container.code_mcp_server.query_job_record",
+            new_callable=AsyncMock,
+            return_value=raw,
+        ):
+            single = await get_task_status(job_id=raw["job_id"], _user_id="alice")
+
+        assert listed["count"] == 1
+        assert listed["jobs"][0] == single
 
     @pytest.mark.asyncio
     async def test_get_task_status_not_found(self):

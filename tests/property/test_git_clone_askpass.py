@@ -72,15 +72,6 @@ def _repo_url(draw):
 
 _branch_name = st.from_regex(r"[a-zA-Z][a-zA-Z0-9\-_]{0,20}", fullmatch=True)
 
-# Optional sparse paths
-_sparse_paths = st.one_of(
-    st.none(),
-    st.lists(
-        st.from_regex(r"[a-zA-Z][a-zA-Z0-9_/]{0,20}", fullmatch=True),
-        min_size=1,
-        max_size=5,
-    ),
-)
 
 
 # ---------------------------------------------------------------------------
@@ -95,11 +86,10 @@ class TestGitAskpassTokenIsolation:
         token=_oauth_token,
         repo_url=_repo_url(),
         branch=_branch_name,
-        sparse_paths=_sparse_paths,
     )
     @settings(max_examples=100, deadline=5_000)
     def test_token_not_in_subprocess_args_and_askpass_set(
-        self, token, repo_url, branch, sparse_paths
+        self, token, repo_url, branch
     ):
         """For any token and repo URL, token SHALL NOT appear in subprocess
         args and GIT_ASKPASS SHALL be set in the subprocess environment."""
@@ -117,7 +107,6 @@ class TestGitAskpassTokenIsolation:
                 token=token,
                 base_branch=branch,
                 work_dir="/tmp/work",
-                sparse_paths=sparse_paths,
             )
 
             # Check every subprocess.run call

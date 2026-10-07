@@ -1,9 +1,10 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: MIT-0
-"""OpenCode AgentCore stack — execution role, security group, ECR, Runtime, Endpoint.
+"""OpenCode AgentCore stack — execution role, security group, Runtime, Endpoint.
 
 Bedrock IAM scoped to single default_model_id. Identity SDK permissions included.
 Single FastMCP Python server on port 8000. Managed session storage enabled.
+The container image is a CDK DockerImageAsset (CDK bootstrap ECR repository).
 
 Requirements: 6.1, 6.4, 10.3, 14.1, 14.2, 14.3, 14.4
 """
@@ -12,18 +13,16 @@ import aws_cdk as cdk
 from aws_cdk import (
     aws_bedrockagentcore as bedrockagentcore,
     aws_ec2 as ec2,
-    aws_ecr as ecr,
     aws_ecr_assets as ecr_assets,
     aws_iam as iam,
     aws_kms as kms,
-    RemovalPolicy,
 )
 import cdk_nag
 from constructs import Construct
 
 
 class AgentCoreStack(cdk.Stack):
-    """AgentCore base resources: IAM role, SG, ECR."""
+    """AgentCore base resources: IAM role, SG, Runtime, Endpoint."""
 
     def __init__(
         self,
@@ -43,26 +42,37 @@ class AgentCoreStack(cdk.Stack):
 
         # -----------------------------------------------------------------
         # Security Group
+        #
+        # No ingress rules. Egress is a single rule: TCP 443 to 0.0.0.0/0
+        # (IPv4 only; the VPC has no IPv6 CIDR). Port 443 serves:
+        # - interface VPC endpoints inside the VPC (Bedrock, AgentCore,
+        #   ECR, CloudWatch Logs/Monitoring, X-Ray, KMS, Secrets Manager, ...)
+        # - the S3 and DynamoDB gateway endpoints (ECR image layers, managed
+        #   session storage sync in VPC mode, the job table)
+        # - public git hosts through the NAT Gateway (repo URLs are
+        #   restricted to https:// in container/pipeline.py)
+        # Execution-role credentials come from the AgentCore MicroVM Metadata
+        # Service, independent of network mode. Security groups cannot block
+        # DNS to the Route 53 Resolver, so no port 53 rule is needed.
+        #
+        # 443-only egress does NOT prevent data exfiltration to arbitrary
+        # HTTPS hosts, and DNS queries to the Route 53 Resolver are not
+        # filtered by this SG either. FQDN-level egress filtering is a
+        # documented residual risk (docs/HARDENING.md#known-limitations);
+        # production deployments should add AWS Network Firewall FQDN rules
+        # or a forward proxy, plus Route 53 Resolver DNS Firewall.
         # -----------------------------------------------------------------
         self.agentcore_sg = ec2.SecurityGroup(
             self,
             "AgentCoreSecurityGroup",
             vpc=self._vpc,
             description="AgentCore container security group",
-            allow_all_outbound=True,
+            allow_all_outbound=False,
         )
-
-        # -----------------------------------------------------------------
-        # ECR Repository
-        # -----------------------------------------------------------------
-        self.ecr_repo = ecr.Repository(
-            self,
-            "OpenCodeEcrRepo",
-            repository_name="opencode-agentcore",
-            removal_policy=RemovalPolicy.RETAIN,
-            image_scan_on_push=True,
-            encryption=ecr.RepositoryEncryption.KMS,
-            encryption_key=self._cmk,
+        self.agentcore_sg.add_egress_rule(
+            peer=ec2.Peer.any_ipv4(),
+            connection=ec2.Port.tcp(443),
+            description="HTTPS to VPC endpoints, S3/DynamoDB gateway endpoints, and git hosts via NAT",
         )
 
         # -----------------------------------------------------------------
@@ -109,10 +119,6 @@ class AgentCoreStack(cdk.Stack):
                 bedrock_resources.append(
                     f"arn:aws:bedrock:{self.region}:{self.account}:inference-profile/{default_model_id}"
                 )
-        # Also allow Sonnet 4 for OpenCode (in-region, works via VPC endpoint)
-        bedrock_resources.append(
-            f"arn:aws:bedrock:*::foundation-model/anthropic.claude-sonnet-4-20250514-v1:0"
-        )
 
         self.execution_role.add_to_policy(
             iam.PolicyStatement(
@@ -132,17 +138,7 @@ class AgentCoreStack(cdk.Stack):
                 actions=["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:Query"],
                 resources=[
                     f"arn:aws:dynamodb:{self.region}:{self.account}:table/opencode-jobs",
-                    f"arn:aws:dynamodb:{self.region}:{self.account}:table/opencode-jobs/index/*",
                 ],
-            )
-        )
-
-        # STS AssumeRole for per-task scoped credentials
-        self.execution_role.add_to_policy(
-            iam.PolicyStatement(
-                sid="StsAssumeRole",
-                actions=["sts:AssumeRole"],
-                resources=[self.execution_role.role_arn],
             )
         )
 
@@ -197,6 +193,9 @@ class AgentCoreStack(cdk.Stack):
                     "bedrock-agentcore:GetResourceOauth2Token",
                     "bedrock-agentcore:GetWorkloadAccessTokenForUserId",
                     "bedrock-agentcore:StopRuntimeSession",
+                    # cancel_task discovers this runtime's own ARN by name
+                    # (CloudFormation cannot inject a resource's own ARN).
+                    "bedrock-agentcore:ListAgentRuntimes",
                 ],
                 resources=[f"arn:aws:bedrock-agentcore:{self.region}:{self.account}:*"],
             )
@@ -255,11 +254,12 @@ class AgentCoreStack(cdk.Stack):
             description="OpenCode AgentCore Runtime — Python FastMCP server on port 8000",
         )
 
-        # RUNTIME_ARN env var — needed by cancel_task for cross-session StopRuntimeSession calls.
+        # cancel_task needs this runtime's ARN for cross-session StopRuntimeSession calls.
         # CloudFormation does not allow self-referencing a resource's own attributes in its
-        # properties. The container resolves the full ARN at startup by calling
-        # DescribeAgentRuntime with the runtime name, or from the platform-injected metadata.
-        # We pass the ARN prefix so the container only needs to append the runtime ID.
+        # properties and the platform does not inject the ARN, so the container discovers
+        # it on first use via ListAgentRuntimes filtered by RUNTIME_NAME (see
+        # _discover_runtime_arn_by_name). RUNTIME_ARN_PREFIX is kept for the
+        # RUNTIME_ARN_PREFIX + AGENT_RUNTIME_ID shortcut when an operator sets the ID.
         self.runtime.add_property_override("EnvironmentVariables", {
             "RUNTIME_ARN_PREFIX": f"arn:aws:bedrock-agentcore:{self.region}:{self.account}:runtime/",
             "RUNTIME_NAME": "opencode_runtime",
@@ -331,53 +331,33 @@ class AgentCoreStack(cdk.Stack):
             [cdk_nag.NagPackSuppression(
                 id="AwsSolutions-IAM5",
                 reason=(
-                    "Runtime execution role: each wildcard is either forced by "
-                    "the AWS service (no resource-level permissions available) "
-                    "or scoped to a resource prefix we own. Specifically: "
-                    "(1) DynamoDB 'index/*' follows the canonical GSI pattern "
-                    "(table ARN is pinned; only GSI names are wildcarded). "
-                    "(2) CloudWatch 'PutMetricData' and X-Ray 'PutTraceSegments' "
-                    "are documented by AWS as not supporting resource-level IAM "
-                    "(see IAM Service Authorization Reference). "
-                    "(3) CloudWatch Logs 'CreateLogStream/PutLogEvents' target "
-                    "log group ARNs owned by this stack; wildcards are on log "
-                    "stream name within those groups. "
-                    "(4) ECR 'GetAuthorizationToken' is an account-level API "
-                    "that mandates Resource: '*'. "
-                    "(5) AgentCore Identity 'GetWorkloadAccessToken' and "
-                    "'GetResourceOauth2Token' scope to the workload identity "
-                    "name; the service currently requires wildcard resources "
-                    "on these actions. "
-                    "See docs/THREAT-MODEL.md section 'Runtime execution role' "
-                    "for the threat mapping."
+                    "Runtime execution role. Resource '*' is service-required "
+                    "for cloudwatch:PutMetricData, the logs:* actions, X-Ray "
+                    "PutTraceSegments/PutTelemetryRecords/GetSampling* and "
+                    "ecr:GetAuthorizationToken, which have no resource-level "
+                    "permissions. The remaining wildcards are prefix-scoped to "
+                    "resources this sample owns: repository/* in this account "
+                    "and Region (the CDK bootstrap container-assets repository "
+                    "that holds the DockerImageAsset), "
+                    "arn:aws:bedrock-agentcore:<region>:<account>:* for the "
+                    "Identity SDK, StopRuntimeSession and ListAgentRuntimes "
+                    "(a list action used by cancel_task to discover this "
+                    "runtime's own ARN by name), and "
+                    "secret:bedrock-agentcore-identity* for the Identity token "
+                    "vault. The Region wildcard on the pinned foundation-model "
+                    "ARN is required because the cross-Region inference profile "
+                    "routes to the model in any eligible Region. The kms:* "
+                    "action wildcards come from Key.grant_encrypt_decrypt() on "
+                    "the single CMK. See docs/THREAT-MODEL.md 'Runtime "
+                    "execution role'."
                 ),
             )],
             apply_to_children=True,
         )
 
-        cdk_nag.NagSuppressions.add_resource_suppressions(
-            self.agentcore_sg,
-            [
-                cdk_nag.NagPackSuppression(
-                    id="AwsSolutions-EC23",
-                    reason=(
-                        "Security group egress is restricted to TCP/443; "
-                        "AWS service traffic routes through VPC endpoints "
-                        "(the CIDR 0.0.0.0/0 only reaches public git hosts "
-                        "via NAT Gateway). FQDN-level egress filtering is "
-                        "documented as a residual risk in "
-                        "docs/HARDENING.md#known-limitations; production "
-                        "deployments are expected to add AWS Network "
-                        "Firewall rules or a forward proxy."
-                    ),
-                ),
-                cdk_nag.NagPackSuppression(
-                    id="CdkNagValidationFailure",
-                    reason=(
-                        "Follow-on finding from AwsSolutions-EC23 for the "
-                        "same 0.0.0.0/0:443 rule; see the EC23 reason above "
-                        "and docs/HARDENING.md#known-limitations."
-                    ),
-                ),
-            ],
-        )
+        # No cdk-nag suppressions on self.agentcore_sg: AwsSolutions-EC23
+        # checks ingress only, and this SG has no ingress rules, so neither
+        # EC23 nor CdkNagValidationFailure fires on it. The egress caveats
+        # (443 does not stop HTTPS or DNS exfiltration) are documented on the
+        # SG definition above. tests/unit/test_agentcore_stack.py
+        # (test_no_unsuppressed_cdk_nag_errors) pins this.

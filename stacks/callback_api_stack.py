@@ -1,9 +1,11 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: MIT-0
-"""OpenCode CallbackApi stack — OAuth callback HTTP API + Lambda.
+"""OpenCode CallbackApi stack — OAuth callback HTTP API + Lambda + workload identity.
 
-Extracted from IdentityStack so that both AgentCoreStack and IdentityStack
-can depend on the callback URL without creating a circular dependency.
+Owns the OAuth callback URL and the AgentCore workload identity
+(``opencode_runtime``) whose allowed OAuth2 return URL is that callback.
+The GitHub OAuth2 credential provider is registered post-deploy by
+``scripts/setup-oauth-app.sh``.
 
 Requirements: 2.2, 3.3, 3.3.1, 3.4, 3.4.1
 """
@@ -13,6 +15,7 @@ import json
 import aws_cdk as cdk
 from aws_cdk import (
     aws_apigatewayv2 as apigwv2,
+    aws_bedrockagentcore as bedrockagentcore,
     aws_apigatewayv2_authorizers as apigwv2_authorizers,
     aws_apigatewayv2_integrations as apigwv2_integrations,
     aws_iam as iam,
@@ -41,22 +44,23 @@ def handler(event, context):
     session_id = q.get("session_id", "")
     state = q.get("state", "")
 
-    print(f"Authorizer: session_id={session_id!r}, state={state!r}")
-    print(f"Authorizer: all params={json.dumps(q)}")
+    # Never log the raw session_id, state, or query params — they carry
+    # sensitive OAuth values. Log only presence booleans.
+    print(f"Authorizer: session_id_present={bool(session_id)}, state_present={bool(state)}")
 
     if not session_id or not state:
         print("DENY: missing session_id or state")
         return {"isAuthorized": False}
     if not _SESSION_ID_RE.match(session_id):
-        print(f"DENY: session_id does not match regex")
+        print("DENY: session_id does not match regex")
         return {"isAuthorized": False}
     try:
         parsed = json.loads(state)
         if not isinstance(parsed, dict) or "user_id" not in parsed:
-            print(f"DENY: state missing user_id, parsed={parsed}")
+            print("DENY: state missing user_id")
             return {"isAuthorized": False}
     except (json.JSONDecodeError, TypeError):
-        print(f"DENY: state not valid JSON")
+        print("DENY: state not valid JSON")
         return {"isAuthorized": False}
     print("ALLOW")
     return {"isAuthorized": True}
@@ -64,7 +68,7 @@ def handler(event, context):
 
 
 class CallbackApiStack(cdk.Stack):
-    """OAuth callback HTTP API — fronts the callback Lambda."""
+    """OAuth callback HTTP API + Lambda, and the AgentCore workload identity."""
 
     def __init__(
         self,
@@ -181,6 +185,17 @@ class CallbackApiStack(cdk.Stack):
         self.callback_url_value = f"{self.http_api.url}callback"
 
         # -----------------------------------------------------------------
+        # AgentCore Workload Identity — binds the Runtime to the OAuth2
+        # credential providers and allows the callback URL as a return URL.
+        # -----------------------------------------------------------------
+        self.workload_identity = bedrockagentcore.CfnWorkloadIdentity(
+            self,
+            "OpenCodeWorkloadIdentity",
+            name="opencode_runtime",
+            allowed_resource_oauth2_return_urls=[self.callback_url_value],
+        )
+
+        # -----------------------------------------------------------------
         # CloudWatch access logging for the HTTP API $default stage
         # -----------------------------------------------------------------
         api_access_log_group = logs.LogGroup(
@@ -212,6 +227,14 @@ class CallbackApiStack(cdk.Stack):
             self, "OAuthCallbackUrl",
             value=self.callback_url_value,
             description="OAuth callback URL (API Gateway HTTP API)",
+        )
+        cdk.CfnOutput(
+            self, "WorkloadIdentityName",
+            value=self.workload_identity.name,
+        )
+        cdk.CfnOutput(
+            self, "WorkloadIdentityArn",
+            value=self.workload_identity.attr_workload_identity_arn,
         )
 
         # -----------------------------------------------------------------

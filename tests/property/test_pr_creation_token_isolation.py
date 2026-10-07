@@ -85,7 +85,7 @@ def _make_subprocess_mock():
     diff_result.stdout = "file.py | 1 +\n"
 
     def side_effect(cmd, **kwargs):
-        if cmd[1:3] == ["diff", "--cached"]:
+        if "diff" in cmd and "--cached" in cmd:
             return diff_result
         return MagicMock()
 

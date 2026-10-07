@@ -80,7 +80,7 @@ See [Obtaining a token](#obtaining-a-token-for-option-b) below for how to get th
 
 ### Option C: AWS IAM -- admin/operator (SigV4)
 
-> **Note:** This option only works if the Gateway is configured with an IAM authorizer for inbound requests. The default deployment uses a Cognito JWT authorizer, so SigV4-signed requests from `mcp-proxy-for-aws` will be rejected with `401 Unauthorized`. Use Option A or Option B with the default deployment. Option C is documented here for deployments that add IAM inbound auth to the Gateway.
+> **Note:** This option only works if the Gateway is configured with an IAM authorizer for inbound requests. The default deployment uses a Cognito JWT authorizer, so SigV4-signed requests from `mcp-proxy-for-aws` will be rejected with `401 Unauthorized`. Use Option A or Option B with the default deployment. Option C is documented here for deployments that add IAM inbound auth to the Gateway. If you enable IAM inbound auth and switch Cedar to ENFORCE, add a `permit` for `AgentCore::IamEntity` principals; the bundled permits cover only `AgentCore::OAuthUser` (see [HARDENING.md](HARDENING.md#cedar-policy-engine)).
 
 For operators and admins with AWS IAM credentials. Uses `mcp-proxy-for-aws` to handle SigV4 signing automatically -- no Cognito token needed.
 
@@ -138,6 +138,8 @@ aws cognito-idp initiate-auth \
   --region <region> \
   --query 'AuthenticationResult.IdToken' --output text
 ```
+
+Use the **ID token**, not the access token: the Cedar policies read the user's role from the `custom:role` claim, which only the ID token carries. The attribute is set by an administrator (see the README, "Create a Cognito user"); get a fresh token after it changes.
 
 The User Pool Client ID is in the `OpenCodeSecurity` stack outputs (`UserPoolClientId`), or find it in the Cognito console under the `opencode-user-pool` pool. Retrieve it with:
 

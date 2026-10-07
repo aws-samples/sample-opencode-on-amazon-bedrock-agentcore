@@ -124,6 +124,15 @@ class SecurityStack(cdk.Stack):
             id_token_validity=cdk.Duration.hours(24),
             access_token_validity=cdk.Duration.hours(24),
             refresh_token_validity=cdk.Duration.days(30),
+            # custom:role drives Cedar authorization, so the client can read it
+            # (it appears in the ID token) but not write it; roles are assigned
+            # only through admin APIs. Both properties update in place.
+            read_attributes=cognito.ClientAttributes()
+            .with_standard_attributes(email=True, email_verified=True)
+            .with_custom_attributes("role"),
+            write_attributes=cognito.ClientAttributes().with_standard_attributes(
+                email=True
+            ),
         )
 
         # Stable CfnOutput exports for Cognito resources
@@ -139,20 +148,6 @@ class SecurityStack(cdk.Stack):
             value=self.user_pool_client.user_pool_client_id,
             export_name="opencode-user-pool-client-id",
         )
-
-        # Cognito User Pool groups for role-based access
-        for group_name, desc in [
-            ("admin", "Platform administrators with full access"),
-            ("developer", "Developers who can submit and manage tasks"),
-            ("readonly", "Read-only users who can view job status"),
-        ]:
-            cognito.CfnUserPoolGroup(
-                self,
-                f"{group_name.capitalize()}Group",
-                group_name=group_name,
-                user_pool_id=self.user_pool.user_pool_id,
-                description=desc,
-            )
 
         # -----------------------------------------------------------------
         # Optional CloudTrail

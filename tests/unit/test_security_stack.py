@@ -161,7 +161,7 @@ class TestSecretsManager:
 # ---------------------------------------------------------------------------
 
 class TestCognitoUserPool:
-    """Verify Cognito User Pool with custom attributes and groups."""
+    """Verify Cognito User Pool with custom attributes."""
 
     def test_user_pool_exists(self):
         """1 user pool — Pool A only (M2M Pool B removed)."""
@@ -219,31 +219,10 @@ class TestCognitoUserPool:
                     )
                     break
 
-    def test_three_user_pool_groups(self):
-        """Three groups: admin, developer, readonly."""
+    def test_no_user_pool_groups(self):
+        """Roles are carried by the custom:role attribute, not Cognito groups."""
         template = _build_security_template()
-        template.resource_count_is("AWS::Cognito::UserPoolGroup", 3)
-
-    def test_admin_group_exists(self):
-        template = _build_security_template()
-        template.has_resource_properties(
-            "AWS::Cognito::UserPoolGroup",
-            {"GroupName": "admin"},
-        )
-
-    def test_developer_group_exists(self):
-        template = _build_security_template()
-        template.has_resource_properties(
-            "AWS::Cognito::UserPoolGroup",
-            {"GroupName": "developer"},
-        )
-
-    def test_readonly_group_exists(self):
-        template = _build_security_template()
-        template.has_resource_properties(
-            "AWS::Cognito::UserPoolGroup",
-            {"GroupName": "readonly"},
-        )
+        template.resource_count_is("AWS::Cognito::UserPoolGroup", 0)
 
     def test_password_policy_min_length(self):
         template = _build_security_template()
@@ -255,6 +234,69 @@ class TestCognitoUserPool:
                         "MinimumLength": 12,
                     }),
                 }),
+            },
+        )
+
+
+# ---------------------------------------------------------------------------
+# App client attribute permissions (custom:role is not client-writable)
+# ---------------------------------------------------------------------------
+
+# Logical ID of the app client before attribute permissions were added. CDK
+# derives it from the construct path, so an unchanged value means
+# CloudFormation updates the existing client instead of creating a new one.
+APP_CLIENT_LOGICAL_ID = "OpenCodeUserPoolOpenCodeAppClientCCBF9C7B"
+
+
+def _app_client() -> tuple[str, dict]:
+    tpl = _build_security_template().to_json()
+    clients = [
+        (lid, res["Properties"]) for lid, res in tpl["Resources"].items()
+        if res["Type"] == "AWS::Cognito::UserPoolClient"
+    ]
+    assert len(clients) == 1, f"Expected exactly one app client, found {len(clients)}"
+    return clients[0]
+
+
+class TestAppClientAttributePermissions:
+    """The app client can read custom:role but cannot write it."""
+
+    def test_single_client_with_expected_name(self):
+        _, props = _app_client()
+        assert props["ClientName"] == "opencode-app-client"
+
+    def test_write_attributes_exclude_custom_role(self):
+        _, props = _app_client()
+        write = props.get("WriteAttributes")
+        assert write, "WriteAttributes must be set explicitly (unset means all writable)"
+        assert "custom:role" not in write
+        assert all(not a.startswith("custom:") for a in write)
+        assert "email" in write
+
+    def test_read_attributes_include_role(self):
+        _, props = _app_client()
+        read = props.get("ReadAttributes", [])
+        for attr in ("custom:role", "email", "email_verified"):
+            assert attr in read, f"{attr} missing from ReadAttributes: {read}"
+
+    def test_auth_flows_unchanged(self):
+        _, props = _app_client()
+        flows = props["ExplicitAuthFlows"]
+        assert "ALLOW_USER_PASSWORD_AUTH" in flows
+        assert "ALLOW_USER_SRP_AUTH" in flows
+
+    def test_logical_id_unchanged(self):
+        lid, _ = _app_client()
+        assert lid == APP_CLIENT_LOGICAL_ID
+
+    def test_role_attribute_still_mutable(self):
+        template = _build_security_template()
+        template.has_resource_properties(
+            "AWS::Cognito::UserPool",
+            {
+                "Schema": assertions.Match.array_with([
+                    assertions.Match.object_like({"Name": "role", "Mutable": True}),
+                ]),
             },
         )
 

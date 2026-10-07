@@ -16,8 +16,9 @@ For any valid constructor inputs the synthesized template MUST have:
   client id.
 - A REQUEST interceptor Lambda named ``opencode-identity-interceptor``
   attached via ``InterceptorConfigurations``.
-- Gateway ``Name == "opencode-gateway"`` and
-  ``ExceptionLevel == "DEBUG"``.
+- Gateway ``Name == "opencode-gateway"`` and verbose exception
+  surfacing OFF by default (no ``ExceptionLevel`` unless the
+  ``gateway_exception_level`` context flag opts in to ``DEBUG``).
 
 Uses Hypothesis to generate random valid Cognito user pool IDs, client
 IDs, and runtime references, then synthesizes the gateway stack and
@@ -55,13 +56,18 @@ def _build_gateway_template(
     user_pool_id: str,
     client_id: str,
     region: str = "us-east-1",
+    extra_context: dict | None = None,
 ) -> assertions.Template:
     """Synthesize the GatewayStack and return the CloudFormation template.
 
     Creates mock CfnRuntime objects to satisfy the constructor, then returns
-    the synthesized CloudFormation template for assertion.
+    the synthesized CloudFormation template for assertion. ``extra_context``
+    overrides/augments the cdk.json context (e.g. to set
+    ``gateway_exception_level``).
     """
     ctx = _load_cdk_context()
+    if extra_context:
+        ctx = {**ctx, **extra_context}
     app = cdk.App(context=ctx)
     env = cdk.Environment(account="123456789012", region=region)
 
@@ -89,9 +95,6 @@ def _build_gateway_template(
         network_configuration=mock_network_config,
     )
 
-    stub_policy_engine_arn = (
-        f"arn:aws:bedrock-agentcore:{region}:123456789012:policy-engine/STUB000001"
-    )
 
     cmk_stack = cdk.Stack(app, "StubCmkStack", env=env)
     stub_cmk = kms.Key(cmk_stack, "StubCmk")
@@ -102,7 +105,6 @@ def _build_gateway_template(
         cognito_user_pool=user_pool,
         cognito_client_id=client_id,
         opencode_runtime=opencode_runtime,
-        policy_engine_arn=stub_policy_engine_arn,
         cmk=stub_cmk,
         env=env,
     )
@@ -290,7 +292,7 @@ class TestGatewayPreservation:
         deadline=30_000,
         suppress_health_check=[HealthCheck.too_slow],
     )
-    def test_gateway_name_and_exception_level(
+    def test_gateway_name_and_exception_level_default_off(
         self,
         user_pool_id: str,
         client_id: str,
@@ -298,7 +300,9 @@ class TestGatewayPreservation:
         """**Validates: Requirements 3.6**
 
         For all valid constructor inputs, the gateway name SHALL be
-        'opencode-gateway' and exception level SHALL be 'DEBUG'.
+        'opencode-gateway' and, when the ``gateway_exception_level``
+        context flag is unset, verbose exception surfacing SHALL be OFF
+        (no ``ExceptionLevel`` property on the synthesized Gateway).
         """
         template = _build_gateway_template(user_pool_id, client_id)
         tpl = template.to_json()
@@ -322,8 +326,50 @@ class TestGatewayPreservation:
             f"Expected gateway name 'opencode-gateway', got '{gateway_name}'"
         )
 
-        # Verify exception level is DEBUG
+        # Verbose exception surfacing must be OFF by default: the
+        # ExceptionLevel property should be absent entirely.
+        assert "ExceptionLevel" not in props, (
+            f"Expected no ExceptionLevel when the flag is unset, got "
+            f"'{props.get('ExceptionLevel')}'"
+        )
+
+    @given(
+        user_pool_id=cognito_pool_id_strategy,
+        client_id=cognito_client_id_strategy,
+    )
+    @settings(
+        max_examples=5,
+        deadline=30_000,
+        suppress_health_check=[HealthCheck.too_slow],
+    )
+    def test_gateway_exception_level_opt_in_debug(
+        self,
+        user_pool_id: str,
+        client_id: str,
+    ):
+        """**Validates: Requirements 3.6**
+
+        When the ``gateway_exception_level`` context flag is set to
+        'DEBUG', the synthesized Gateway SHALL carry
+        ``ExceptionLevel == 'DEBUG'``.
+        """
+        template = _build_gateway_template(
+            user_pool_id,
+            client_id,
+            extra_context={"gateway_exception_level": "DEBUG"},
+        )
+        tpl = template.to_json()
+
+        gateways = {
+            lid: res
+            for lid, res in tpl["Resources"].items()
+            if res["Type"] == "AWS::BedrockAgentCore::Gateway"
+        }
+        _lid, gateway = next(iter(gateways.items()))
+        props = gateway.get("Properties", {})
+
         exception_level = props.get("ExceptionLevel", "")
         assert exception_level == "DEBUG", (
-            f"Expected exception level 'DEBUG', got '{exception_level}'"
+            f"Expected exception level 'DEBUG' when opted in, got "
+            f"'{exception_level}'"
         )

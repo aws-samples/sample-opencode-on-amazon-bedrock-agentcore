@@ -65,6 +65,9 @@ class TestResolveGitCredentialUsesCache:
     @patch("container.tools.resolve_git_credential.boto3.client")
     def test_multiple_calls_create_client_once(self, mock_boto3_client):
         mock_client = MagicMock()
+        mock_client.get_workload_access_token_for_user_id.return_value = {
+            "workloadAccessToken": "wat"
+        }
         mock_client.get_resource_oauth2_token.return_value = {
             "accessToken": "fake-token"
         }
@@ -73,12 +76,10 @@ class TestResolveGitCredentialUsesCache:
         _mod.resolve_git_credential(
             user_id="user1",
             repo_url="https://github.com/owner/repo",
-            workload_access_token="wat-123",
         )
         _mod.resolve_git_credential(
             user_id="user2",
             repo_url="https://github.com/owner/repo2",
-            workload_access_token="wat-456",
         )
 
         # boto3.client should only be called once despite two resolve calls
@@ -87,6 +88,9 @@ class TestResolveGitCredentialUsesCache:
     @patch("container.tools.resolve_git_credential.boto3.client")
     def test_three_calls_still_one_client(self, mock_boto3_client):
         mock_client = MagicMock()
+        mock_client.get_workload_access_token_for_user_id.return_value = {
+            "workloadAccessToken": "wat"
+        }
         mock_client.get_resource_oauth2_token.return_value = {
             "accessToken": "tok"
         }
@@ -96,7 +100,6 @@ class TestResolveGitCredentialUsesCache:
             _mod.resolve_git_credential(
                 user_id=f"user{i}",
                 repo_url="https://github.com/o/r",
-                workload_access_token="wat",
             )
 
         mock_boto3_client.assert_called_once()

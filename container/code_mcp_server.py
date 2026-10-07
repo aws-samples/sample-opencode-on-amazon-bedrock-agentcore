@@ -3,12 +3,14 @@
 """OpenCode MCP Server — single FastMCP server on port 8000.
 
 Exposes 6 OpenCode tools via Streamable HTTP:
-  - code             (sync — streams progress, supports ctx.elicit() for OAuth)
+  - code             (sync — relays progress notifications when the client sends a
+                      progressToken, supports ctx.elicit() for OAuth)
   - run_coding_task   (async — returns job_id immediately, runs pipeline in background)
   - connect_git_host  (interactive — OAuth consent flow via ctx.elicit())
   - get_task_status   (query — read job record from DynamoDB)
   - list_tasks        (query — list user's jobs from DynamoDB)
-  - cancel_task       (control — cancel running task, in-process first then cross-session)
+  - cancel_task       (control — StopRuntimeSession on the job's recorded session;
+                      in-process only when the job runs on the same microVM)
 
 Requirements: 1.1-1.6, 2.1-2.7, 3.1-3.4, 4.1-4.6, 5.1-5.3,
               6.1-6.4, 8.1-8.5, 15.1, 15.2, 16.1,
@@ -18,13 +20,15 @@ Requirements: 1.1-1.6, 2.1-2.7, 3.1-3.4, 4.1-4.6, 5.1-5.3,
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 import sys
-import time
 import uuid
 from datetime import datetime, timezone
+from typing import Mapping
+
+import boto3
+from botocore.exceptions import ClientError
 
 # Configure structured JSON logging to stdout so CloudWatch Logs Insights
 # can filter on specific fields like job_id, user_id, and status.
@@ -40,37 +44,33 @@ logging.root.handlers = [_handler]
 logging.root.setLevel(logging.INFO)
 logger = logging.getLogger(__name__)
 
-_startup_start = time.time()
-logger.info("Module loading started")
-
 from fastmcp import Context, FastMCP
-
-logger.info("fastmcp imported (%.1fs)", time.time() - _startup_start)
-
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
 
-logger.info("bedrock_agentcore imported (%.1fs)", time.time() - _startup_start)
+try:
+    from fastmcp.server.dependencies import get_http_headers
+except Exception:  # pragma: no cover - only hit when fastmcp is stubbed
+
+    def get_http_headers(include_all: bool = False, include=None) -> dict:
+        """Fallback used when FastMCP's dependency helper is unavailable."""
+        return {}
 
 from container.lib.dynamodb_helpers import (
+    JobStateConflict,
     query_job_record,
     query_user_jobs,
+    serialize_job_record,
     update_job_status,
 )
-
-logger.info("dynamodb_helpers imported (%.1fs)", time.time() - _startup_start)
-
 from container.pipeline import run_coding_pipeline
-
-logger.info("container.pipeline imported (%.1fs)", time.time() - _startup_start)
-
 from container.lib.credential_errors import GIT_HOST_NOT_CONNECTED_MESSAGE
+from container.tools import resolve_git_credential
 
 # ---------------------------------------------------------------------------
 # FastMCP + AgentCore app
 # ---------------------------------------------------------------------------
 mcp = FastMCP("opencode")
 app = BedrockAgentCoreApp()
-logger.info("FastMCP + AgentCoreApp created (%.1fs)", time.time() - _startup_start)
 
 
 # /ping health check on port 8000 — required by the AgentCore platform.
@@ -87,9 +87,79 @@ _running_tasks: dict[str, asyncio.Task] = {}
 _cancel_flags: dict[str, bool] = {}
 
 # ── Environment variables for control tools ───────────────────────────────
-WORKLOAD_NAME = os.environ.get("WORKLOAD_NAME", "opencode_runtime")
 ELICITATION_TIMEOUT_S = int(os.environ.get("ELICITATION_TIMEOUT_S", "300"))
+# How long cancel_task waits for an in-process task to finish after
+# task.cancel() before falling back to cross-session StopRuntimeSession.
+IN_PROCESS_CANCEL_TIMEOUT_S = float(
+    os.environ.get("IN_PROCESS_CANCEL_TIMEOUT_S", "10")
+)
 REGION = os.environ.get("AWS_REGION", "us-east-1")
+
+# ── Runtime session id helpers ────────────────────────────────────────────
+
+_RUNTIME_SESSION_HEADER = "x-amzn-bedrock-agentcore-runtime-session-id"
+_BAGGAGE_SESSION_KEY = "session.id"
+
+
+def _runtime_session_id_from_headers(headers: Mapping[str, str]) -> str:
+    """Extract the AgentCore runtime session id from inbound HTTP headers.
+
+    Header names are matched case-insensitively. The dedicated
+    ``X-Amzn-Bedrock-AgentCore-Runtime-Session-Id`` header is checked first
+    for forward compatibility with the documented AgentCore contract. In
+    practice (observed on the live platform, not a documented contract) the
+    Gateway -> Runtime hop does not forward that header; the runtime
+    session id reaches the container only as the ``session.id`` member of
+    the W3C ``baggage`` header, e.g.
+    ``Self=1-6ac63484-...,session.id=f67ddcd1-dc44-4867-8793-e4888e672b6b``.
+    That value is what ``StopRuntimeSession`` accepts as ``runtimeSessionId``
+    (the ``mcp-session-id`` header is the MCP transport session, not the
+    runtime session, and is rejected by the API).
+
+    Returns ``''`` when neither source carries a session id.
+    """
+    lowered = {str(k).lower(): v for k, v in headers.items()}
+
+    direct = (lowered.get(_RUNTIME_SESSION_HEADER) or "").strip()
+    if direct:
+        return direct
+
+    baggage = lowered.get("baggage") or ""
+    for member in baggage.split(","):
+        member = member.strip()
+        if not member or "=" not in member:
+            continue
+        key, _, rest = member.partition("=")
+        if key.strip() != _BAGGAGE_SESSION_KEY:
+            continue
+        # Drop any ``;property`` suffix per the W3C Baggage grammar.
+        value = rest.split(";", 1)[0].strip()
+        if value:
+            return value
+    return ""
+
+
+def _current_runtime_session_id() -> str:
+    """Return the runtime session id for the request being handled, or ``''``.
+
+    Reads the inbound headers via FastMCP's ``get_http_headers`` (which
+    only works inside a request context) and delegates to
+    :func:`_runtime_session_id_from_headers`. Never raises.
+    """
+    try:
+        headers = get_http_headers(include_all=True) or {}
+    except Exception:
+        logger.warning("get_http_headers failed; no runtime session id", exc_info=True)
+        headers = {}
+
+    session_id = _runtime_session_id_from_headers(headers)
+    if not session_id:
+        logger.warning(
+            "No AgentCore runtime session id in inbound headers (names=%s); "
+            "cross-session cancel will be unavailable for this job",
+            sorted(str(k).lower() for k in headers.keys()),
+        )
+    return session_id
 
 # ── Elicitation timeout helper ─────────────────────────────────────────────
 
@@ -116,70 +186,18 @@ async def _elicit_with_timeout(ctx, *, message, schema):
         return None
 
 
-# ── Identity SDK helpers ──────────────────────────────────────────────────
-
-_identity_sdk_client = None
-
-
-def _identity_client():
-    global _identity_sdk_client
-    if _identity_sdk_client is None:
-        import boto3
-        _identity_sdk_client = boto3.client("bedrock-agentcore", region_name=REGION)
-    return _identity_sdk_client
-
-
-def _get_workload_token(user_id: str) -> str:
-    """Obtain a workload access token for the given user from AgentCore Identity."""
-    return _identity_client().get_workload_access_token_for_user_id(
-        workloadName=WORKLOAD_NAME, userId=user_id
-    )["workloadAccessToken"]
-
-
-def _get_oauth_callback_url() -> str:
-    """Return the OAuth callback URL from environment."""
-    return os.environ.get("OAUTH_CALLBACK_URL", "")
-
-
-def _provider_name(domain: str) -> str:
-    """Map a git host domain to its AgentCore Identity credential provider name."""
-    return "github-provider" if domain == "github.com" else f"custom-{domain}"
-
+# ── Credential helper ─────────────────────────────────────────────────────
 
 def _get_credential(user_id: str, git_host: str):
-    """Return (token, None) or (None, auth_url)."""
-    token = _get_workload_token(user_id)
-    params = {
-        "workloadIdentityToken": token,
-        "resourceCredentialProviderName": _provider_name(git_host),
-        "oauth2Flow": "USER_FEDERATION",
-        "scopes": ["repo"],
-    }
-    callback = _get_oauth_callback_url()
-    if callback:
-        params["resourceOauth2ReturnUrl"] = callback
-        params["customState"] = json.dumps({"user_id": user_id})
+    """Return (token, None) or (None, auth_url) for ``git_host``.
 
-    try:
-        resp = _identity_client().get_resource_oauth2_token(**params)
-        if resp.get("authorizationUrl"):
-            return None, resp["authorizationUrl"]
-        return resp["accessToken"], None
-    except Exception as exc:
-        # Older SDK versions raise an exception instead of returning
-        # authorizationUrl in the response body. The exception class name
-        # varies across SDK versions, so match by attribute or string.
-        auth_url = getattr(exc, "authorization_url", None)
-        if auth_url:
-            return None, auth_url
-        err_str = str(exc)
-        if "authorizationUrl" in err_str or "AuthorizationUrl" in err_str:
-            # Try to extract from the response metadata
-            resp_meta = getattr(exc, "response", {})
-            auth_url = resp_meta.get("authorizationUrl", "")
-            if auth_url:
-                return None, auth_url
-        raise
+    Thin adaptor over the pipeline's ``resolve_git_credential`` so
+    ``connect_git_host`` and the coding pipeline share one code path.
+    """
+    cred = resolve_git_credential(user_id=user_id, repo_url=f"https://{git_host}/")
+    if cred.get("authorization_required"):
+        return None, cred.get("auth_url", "")
+    return cred["token"], None
 
 
 # ── Response helpers ──────────────────────────────────────────────────────
@@ -198,11 +216,39 @@ SESSION_STORAGE_PATH = os.environ.get(
 )
 
 
+_discovered_runtime_arn: str = ""
+
+
+def _discover_runtime_arn_by_name(runtime_name: str) -> str:
+    """Look up this runtime's ARN via ListAgentRuntimes (cached once found).
+
+    CloudFormation cannot inject a resource's own ARN into its environment
+    and the platform does not expose it inside the container, so the ARN is
+    discovered from the control plane by name on first use.
+    """
+    global _discovered_runtime_arn
+    if _discovered_runtime_arn:
+        return _discovered_runtime_arn
+    try:
+        client = boto3.client("bedrock-agentcore-control", region_name=REGION)
+        paginator = client.get_paginator("list_agent_runtimes")
+        for page in paginator.paginate():
+            for rt in page.get("agentRuntimes", []):
+                if rt.get("agentRuntimeName") == runtime_name:
+                    _discovered_runtime_arn = rt.get("agentRuntimeArn", "")
+                    return _discovered_runtime_arn
+        logger.warning("No agent runtime named %r found in %s", runtime_name, REGION)
+    except Exception as exc:  # noqa: BLE001 - never let discovery break the caller
+        logger.warning("ListAgentRuntimes failed while resolving runtime ARN: %s", exc)
+    return ""
+
+
 def _get_runtime_arn() -> str:
     """Resolve the AgentCore runtime ARN.
 
     Checks RUNTIME_ARN first (direct), then constructs from
-    RUNTIME_ARN_PREFIX + runtime ID discovered via the AgentCore SDK.
+    RUNTIME_ARN_PREFIX + AGENT_RUNTIME_ID, then discovers the ARN by
+    RUNTIME_NAME through the control plane. Returns '' if all fail.
     """
     arn = os.environ.get("RUNTIME_ARN") or os.environ.get("OPENCODE_RUNTIME_ARN", "")
     if arn:
@@ -211,6 +257,9 @@ def _get_runtime_arn() -> str:
     runtime_id = os.environ.get("AGENT_RUNTIME_ID", "")
     if prefix and runtime_id:
         return f"{prefix}{runtime_id}"
+    runtime_name = os.environ.get("RUNTIME_NAME", "")
+    if runtime_name:
+        return _discover_runtime_arn_by_name(runtime_name)
     return ""
 
 
@@ -242,12 +291,21 @@ async def code(
     Use this tool for quick, focused tasks (file creation, small edits,
     config changes) where you want the PR URL back immediately in the
     same conversation turn. The connection stays open for the full
-    duration (typically 10-30 seconds). Progress is streamed. If git
-    credentials are missing, an OAuth consent prompt is shown inline.
+    duration (typically 10-30 seconds). Progress notifications are relayed
+    when the client sends a progressToken. If git credentials are missing,
+    an OAuth consent prompt is shown inline.
 
     Prefer run_coding_task (async) instead when the task is complex
     (multi-file refactors, large features) and may take several minutes,
     or when you want to fire-and-forget and check status later.
+
+    Behaviour: the pipeline always commits every change left in the
+    working tree and opens a pull request against base_branch, regardless
+    of task wording (asking the agent not to commit has no effect).
+    base_branch must already exist on the remote. Changes are pushed to
+    target_branch, which defaults to opencode/<job_id> and must differ
+    from base_branch. files_edited lists paths relative to the repository
+    root.
     """
     # --- Validation ---
     if not _user_id:
@@ -307,6 +365,7 @@ async def code(
         work_dir=work_dir,
         timeout_minutes=timeout_minutes,
         metric_prefix="code",
+        runtime_session_id=_current_runtime_session_id(),
         on_progress=_on_progress,
         on_oauth_needed=_on_oauth_needed,
         cancel_flag=None,
@@ -338,6 +397,14 @@ async def run_coding_task(
 
     Prefer code (sync) instead for quick tasks where you want the PR
     URL back in the same turn.
+
+    Behaviour: the pipeline always commits every change left in the
+    working tree and opens a pull request against base_branch, regardless
+    of task wording (asking the agent not to commit has no effect).
+    base_branch must already exist on the remote. Changes are pushed to
+    target_branch, which defaults to opencode/<job_id> and must differ
+    from base_branch. files_edited lists paths relative to the repository
+    root.
     """
     if not _user_id:
         return {"status": "failed", "error": "No user_id available"}
@@ -351,17 +418,15 @@ async def run_coding_task(
     branch = target_branch or f"opencode/{job_id}"
     work_dir = _work_dir_for_job(job_id)
 
-    # Capture runtime_session_id from request header (Req 4.4); the pipeline
-    # persists it into the initial RUNNING DynamoDB row so cancel_task can
-    # fall back to StopRuntimeSession.
-    runtime_session_id = ""
-    if ctx and hasattr(ctx, "request") and ctx.request:
-        runtime_session_id = (ctx.request.headers or {}).get(
-            "X-Amzn-Bedrock-AgentCore-Runtime-Session-Id", ""
-        )
+    # Capture runtime_session_id from the inbound request (Req 4.4); the
+    # pipeline persists it into the initial RUNNING DynamoDB row so
+    # cancel_task can fall back to StopRuntimeSession.
+    runtime_session_id = _current_runtime_session_id()
 
-    # Register with AgentCore async task management (Req 4.2, 15.1)
-    app.add_async_task(job_id)
+    # Register with AgentCore async task management (Req 4.2, 15.1). The
+    # SDK returns an integer handle; complete_async_task must receive that
+    # exact handle or the Runtime stays HealthyBusy forever.
+    task_id = app.add_async_task(job_id)
 
     # Set up cancellation flag (Req 7.1)
     _cancel_flags[job_id] = False
@@ -385,7 +450,11 @@ async def run_coding_task(
             )
         finally:
             try:
-                app.complete_async_task(job_id)
+                completed = app.complete_async_task(task_id)
+                logger.info(
+                    "complete_async_task(%s) for job %s -> %s",
+                    task_id, job_id, completed,
+                )
             except Exception:
                 logger.exception(
                     "Failed to complete_async_task for job %s", job_id
@@ -420,7 +489,7 @@ async def connect_git_host(git_host: str, _user_id: str = "", ctx: Context | Non
         access_token, auth_url = _get_credential(user_id, git_host)
     except Exception as exc:
         err = str(exc)
-        if "NoCredentialProvider" in err or "ResourceNotFoundException" in err:
+        if "No credential provider" in err or "ResourceNotFoundException" in err:
             return _fail(git_host, f"No credential provider registered for '{git_host}'. Contact your administrator.")
         return _fail(git_host, f"Failed to check git host credentials: {err}")
 
@@ -500,7 +569,8 @@ async def connect_git_host(git_host: str, _user_id: str = "", ctx: Context | Non
 async def get_task_status(job_id: str, _user_id: str = "") -> dict:
     """Get the status of a coding task by job_id.
 
-    Queries DynamoDB scoped to the authenticated user.
+    Queries DynamoDB scoped to the authenticated user. Returns the same
+    record shape as each entry in list_tasks.
     """
     if not _user_id:
         return {"error": "No user_id available"}
@@ -509,21 +579,7 @@ async def get_task_status(job_id: str, _user_id: str = "") -> dict:
     if not record:
         return {"error": "Job not found"}
 
-    return {
-        "job_id": record.get("job_id", ""),
-        "status": record.get("status", ""),
-        "task_description": record.get("task_description", ""),
-        "repo_url": record.get("repo_url", ""),
-        "base_branch": record.get("base_branch", ""),
-        "target_branch": record.get("target_branch", ""),
-        "pr_url": record.get("pr_url", ""),
-        "stop_reason": record.get("stop_reason", ""),
-        "files_edited": record.get("files_edited", []),
-        "duration_seconds": record.get("duration_seconds", 0),
-        "error": record.get("error", ""),
-        "created_at": record.get("created_at", ""),
-        "completed_at": record.get("completed_at", ""),
-    }
+    return serialize_job_record(record)
 
 
 # ---------------------------------------------------------------------------
@@ -537,28 +593,111 @@ async def list_tasks(
 ) -> dict:
     """List coding tasks for the authenticated user.
 
-    Optional status filter. Limit capped at 100.
+    Optional status filter. Limit capped at 100. Each job has the same
+    shape as a get_task_status response.
     """
     if not _user_id:
         return {"error": "No user_id available"}
 
-    return await query_user_jobs(
+    result = await query_user_jobs(
         user_id=_user_id,
         status_filter=status,
         limit=min(limit, 100),
     )
+    return {
+        "jobs": [serialize_job_record(j) for j in result["jobs"]],
+        "count": result["count"],
+    }
 
 
 # ---------------------------------------------------------------------------
 # Tool 6: cancel_task (control) — Req 1.5, 6.1, 6.2, 6.3
 # ---------------------------------------------------------------------------
+_TERMINAL_STATES = ("COMPLETE", "FAILED", "CANCELLED")
+
+
+def _duration_since(created_at: str) -> float:
+    """Seconds elapsed since an ISO-8601 ``created_at``; 0.0 if unparseable."""
+    try:
+        created = datetime.fromisoformat(str(created_at))
+    except (TypeError, ValueError):
+        return 0.0
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    return round((datetime.now(timezone.utc) - created).total_seconds(), 2)
+
+
+def _cancel_failed(job_id: str, status: str, detail: str) -> dict:
+    """Build the ``cancel_failed`` response shape (nothing was stopped)."""
+    return {
+        "job_id": job_id,
+        "status": status,
+        "error": "cancel_failed",
+        "detail": detail,
+    }
+
+
+_HANDLER_RECORDED_DETAIL = (
+    "CANCELLED was recorded by the job's own cancellation handler"
+)
+
+
+async def _record_cancelled(job_id: str, user_id: str, record: dict) -> str | None:
+    """Conditionally write the CANCELLED row for a job that was stopped.
+
+    Returns ``None`` when this call wrote the row. If the record already
+    left ``RUNNING`` (another writer won the race) nothing is written and
+    the record's current status is returned instead so the caller can
+    decide: ``CANCELLED`` means the stopped microVM's pipeline recorded the
+    cancellation itself during shutdown (the cancel still succeeded);
+    ``COMPLETE`` / ``FAILED`` mean the job finished before the stop took
+    effect.
+    """
+    try:
+        await update_job_status(
+            job_id=job_id,
+            user_id=user_id,
+            status="CANCELLED",
+            expected_status="RUNNING",
+            error="Task cancelled by user",
+            pr_url="",
+            stop_reason="",
+            files_edited=[],
+            duration_seconds=_duration_since(record.get("created_at", "")),
+            completed_at=datetime.now(timezone.utc).isoformat(),
+        )
+    except JobStateConflict:
+        latest = await query_job_record(job_id=job_id, user_id=user_id)
+        status = (latest or record).get("status", "")
+        logger.info(
+            "cancel_task job %s: record already %s before CANCELLED was recorded",
+            job_id, status,
+        )
+        return status
+    return None
+
+
 @mcp.tool()
 async def cancel_task(job_id: str, _user_id: str = "") -> dict:
-    """Cancel a running coding task.
+    """Cancel a running coding task and report whether it was actually stopped.
 
-    Tries in-process cancellation first (same microVM), then falls back
-    to cross-session cancellation via StopRuntimeSession.
-    Validates user ownership before executing.
+    Only the job's owner can cancel it. The task is stopped in-process when
+    it runs on this microVM; otherwise the microVM recorded for the job is
+    terminated via StopRuntimeSession.
+
+    Response contract:
+
+    - Stopped (or provably no longer running):
+      {"job_id", "status": "CANCELLED",
+       "method": "in_process" | "stop_runtime_session" | "session_already_terminated"}
+      The job record is updated to CANCELLED. An optional "detail" string
+      explains how the outcome was reached.
+    - Nothing could be stopped:
+      {"job_id", "status": <current record status, usually "RUNNING">,
+       "error": "cancel_failed", "detail": <human-readable reason>}
+      The job record is NOT modified; the task may still be running.
+    - Unknown job: {"error": "Job not found"}
+    - Already finished: {"error": "Job is already in terminal state: <STATUS>"}
     """
     if not _user_id:
         return {"error": "No user_id available"}
@@ -570,57 +709,145 @@ async def cancel_task(job_id: str, _user_id: str = "") -> dict:
 
     # Reject terminal state jobs
     current_status = record.get("status", "")
-    if current_status in ("COMPLETE", "FAILED", "CANCELLED"):
+    if current_status in _TERMINAL_STATES:
         return {"error": f"Job is already in terminal state: {current_status}"}
 
-    # Attempt in-process cancellation first (Req 6.1)
-    in_process_attempted = False
-    if job_id in _running_tasks:
-        in_process_attempted = True
+    session_id = record.get("runtime_session_id", "") or ""
+    detail_prefix = ""
+
+    # ── 1. In-process cancellation (job runs on this microVM) ─────────────
+    task = _running_tasks.get(job_id)
+    if task is not None:
         try:
             _cancel_flags[job_id] = True
-            _running_tasks[job_id].cancel()
-            logger.info("In-process cancellation signaled for job %s", job_id)
+            task.cancel()
+            done, _pending = await asyncio.wait(
+                {task}, timeout=IN_PROCESS_CANCEL_TIMEOUT_S
+            )
         except Exception:
             logger.warning(
-                "In-process cancellation failed for job %s — falling back to StopRuntimeSession",
-                job_id,
+                "In-process cancellation raised for job %s; falling back to "
+                "StopRuntimeSession", job_id, exc_info=True,
             )
-            in_process_attempted = False  # fall through to cross-session
+            done = set()
 
-    # Fall back to StopRuntimeSession if not in-process or in-process failed (Req 6.2)
-    if not in_process_attempted:
-        session_id = record.get("runtime_session_id", "")
-        if session_id:
-            runtime_arn = _get_runtime_arn()
-            if not runtime_arn:
-                logger.warning(
-                    "Cannot call StopRuntimeSession: runtime ARN unresolved (job %s)", job_id
+        if done:
+            # The pipeline's CancelledError handler wrote CANCELLED itself.
+            latest = await query_job_record(job_id=job_id, user_id=_user_id)
+            latest_status = (latest or {}).get("status", "")
+            if latest_status == "CANCELLED":
+                logger.info(
+                    "cancel_task job %s: method=in_process runtime_session_id=%s",
+                    job_id, session_id,
                 )
-            else:
-                try:
-                    import boto3
-                    client = boto3.client(
-                        "bedrock-agentcore",
-                        region_name=REGION,
-                    )
-                    client.stop_runtime_session(
-                        agentRuntimeArn=runtime_arn,
-                        runtimeSessionId=session_id,
-                    )
-                except Exception:
-                    logger.warning(
-                        "StopRuntimeSession failed for job %s session %s -- "
-                        "proceeding with DynamoDB update",
-                        job_id, session_id,
-                    )
+                return {"job_id": job_id, "status": "CANCELLED", "method": "in_process"}
+            if latest_status in _TERMINAL_STATES:
+                # The task finished on its own before the cancel took effect.
+                logger.info(
+                    "cancel_task job %s: finished as %s before in-process cancel",
+                    job_id, latest_status,
+                )
+                return {"error": f"Job is already in terminal state: {latest_status}"}
+            detail_prefix = (
+                "in-process task finished after cancel but the record is "
+                f"still {latest_status or 'RUNNING'}; "
+            )
+        else:
+            detail_prefix = (
+                "in-process cancel signalled but the task did not finish "
+                f"within {IN_PROCESS_CANCEL_TIMEOUT_S:g}s; "
+            )
 
-    # Always update DynamoDB to CANCELLED regardless of cancellation path (Req 6.3)
-    await update_job_status(
-        job_id=job_id, user_id=_user_id, status="CANCELLED",
-        completed_at=datetime.now(timezone.utc).isoformat(),
+    # ── 2. Cross-session cancellation via StopRuntimeSession ──────────────
+    # NOTE: when the in-process branch above fell through (task is not None),
+    # ``session_id`` is THIS microVM's own runtime session, so the stop below
+    # terminates the VM serving this very request: the caller sees a transport
+    # error instead of a response and the CANCELLED row is then written by the
+    # pipeline's own CancelledError handler during shutdown, not by this tool.
+    # Accepted as a last resort for a task that ignores cancellation; through
+    # the Gateway every call lands on a fresh microVM, so this path is not
+    # reached in practice.
+    if not session_id:
+        detail = (
+            detail_prefix
+            + "job record has no runtime_session_id; cannot locate the "
+            "microVM running it"
+        )
+        logger.info("cancel_task job %s: cancel_failed (%s)", job_id, detail)
+        return _cancel_failed(job_id, current_status, detail)
+
+    # May call the control plane on first use; keep it off the event loop.
+    runtime_arn = await asyncio.to_thread(_get_runtime_arn)
+    if not runtime_arn:
+        logger.warning(
+            "Cannot call StopRuntimeSession: runtime ARN unresolved (job %s)", job_id
+        )
+        return _cancel_failed(
+            job_id, current_status, detail_prefix + "runtime ARN unresolved"
+        )
+
+    method = "stop_runtime_session"
+    detail = detail_prefix.rstrip("; ") if detail_prefix else ""
+    try:
+        client = boto3.client("bedrock-agentcore", region_name=REGION)
+        await asyncio.to_thread(
+            client.stop_runtime_session,
+            agentRuntimeArn=runtime_arn,
+            runtimeSessionId=session_id,
+        )
+    except ClientError as err:
+        err_info = err.response.get("Error", {})
+        code = err_info.get("Code", "") or type(err).__name__
+        message = err_info.get("Message", "") or str(err)
+        if code == "ResourceNotFoundException":
+            # The microVM is provably gone (expired or already stopped).
+            method = "session_already_terminated"
+            detail = (
+                detail_prefix
+                + f"runtime session {session_id} not found or already "
+                f"terminated: {message}"
+            )
+        else:
+            logger.warning(
+                "StopRuntimeSession failed for job %s session %s: %s: %s",
+                job_id, session_id, code, message,
+            )
+            return _cancel_failed(
+                job_id, current_status,
+                detail_prefix + f"StopRuntimeSession failed: {code}: {message}",
+            )
+    except Exception as exc:
+        logger.warning(
+            "StopRuntimeSession failed for job %s session %s: %s: %s",
+            job_id, session_id, type(exc).__name__, exc,
+        )
+        return _cancel_failed(
+            job_id, current_status,
+            detail_prefix
+            + f"StopRuntimeSession failed: {type(exc).__name__}: {exc}",
+        )
+
+    # ── 3. Record CANCELLED (conditional on the row still being RUNNING) ──
+    conflict_status = await _record_cancelled(job_id, _user_id, record)
+    if conflict_status == "CANCELLED":
+        # The killed microVM's pipeline ran its CancelledError handler
+        # during shutdown and won the race for the CANCELLED write. The
+        # stop itself succeeded, so this is still a successful cancel.
+        detail = f"{detail}; {_HANDLER_RECORDED_DETAIL}" if detail else _HANDLER_RECORDED_DETAIL
+    elif conflict_status is not None:
+        return _cancel_failed(
+            job_id, conflict_status,
+            "job reached a terminal state before the cancellation was recorded",
+        )
+
+    logger.info(
+        "cancel_task job %s: method=%s runtime_session_id=%s",
+        job_id, method, session_id,
     )
-    return {"job_id": job_id, "status": "CANCELLED"}
+    result = {"job_id": job_id, "status": "CANCELLED", "method": method}
+    if detail:
+        result["detail"] = detail
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -637,5 +864,5 @@ if __name__ == "__main__":
     )
     _validate_opencode_binary(OPENCODE_BINARY)
 
-    logger.info("Starting FastMCP on port 8000 (%.1fs since module load)", time.time() - _startup_start)
+    logger.info("Starting FastMCP on port 8000")
     mcp.run(transport="streamable-http", host="0.0.0.0", port=8000)

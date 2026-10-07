@@ -1,6 +1,6 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: MIT-0
-"""Property tests: DynamoDB job record round-trip, update extras, and GSI1 attributes.
+"""Property tests: DynamoDB job record round-trip and update extras.
 
 **Validates: Requirements 3.3, 3.4, 5.1, 5.2**
 
@@ -12,10 +12,6 @@ Property 5 -- DynamoDB update extras persistence:
   For any subset of allowed extras with non-None values, calling
   update_job_status SHALL include all provided extras in the DynamoDB
   update expression.
-
-Property 7 -- GSI1 attributes match current status:
-  For any write or update, GSI1PK SHALL equal status#{current_status}.
-  On write, GSI1SK SHALL equal the created_at timestamp.
 """
 
 from __future__ import annotations
@@ -28,7 +24,10 @@ import pytest
 from hypothesis import given, settings, assume
 from hypothesis import strategies as st
 
+from botocore.exceptions import ClientError
+
 from container.lib.dynamodb_helpers import (
+    JobStateConflict,
     write_job_record,
     update_job_status,
     query_job_record,
@@ -227,6 +226,12 @@ class TestDynamoDBUpdateExtras:
         assert ":status" in attr_values
         assert attr_values[":status"] == new_status
 
+        # Terminal writes are conditional on the row still being RUNNING
+        # by default, so a late COMPLETE can never overwrite CANCELLED.
+        assert update_call["ConditionExpression"] == "#st = :expected"
+        assert attr_values[":expected"] == "RUNNING"
+        assert attr_names["#st"] == "status"
+
         # Every provided extra should appear in the update expression
         for key, value in extras.items():
             placeholder = f":{key}"
@@ -250,101 +255,129 @@ class TestDynamoDBUpdateExtras:
 
 
 # ---------------------------------------------------------------------------
-# Property 7: GSI1 attributes match current status
+# Conditional terminal write (expected_status / JobStateConflict)
 # ---------------------------------------------------------------------------
 
 
-class TestGSI1Attributes:
-    """**Validates: Requirements 5.1, 5.2**
+def _mock_table_with_record(job_id: str, user_id: str, status: str = "RUNNING"):
+    existing_item = {
+        "PK": f"user#{user_id}",
+        "SK": f"job#{job_id}#2024-01-01T00:00:00+00:00",
+        "job_id": job_id,
+        "user_id": user_id,
+        "status": status,
+    }
+    captured: list[dict] = []
+    mock_table = MagicMock()
+    mock_table.query = lambda **kwargs: {"Items": [existing_item]}
+    mock_table.update_item = lambda **kwargs: captured.append(kwargs)
+    return mock_table, captured
 
-    NOTE: GSI1 attributes (GSI1PK, GSI1SK) are added by Task 5. This test
-    verifies the property once Task 5 is implemented. If GSI1PK is present
-    in the written item, it must equal status#{current_status}. If GSI1SK
-    is present on write, it must equal the created_at timestamp.
-    """
+
+class TestDynamoDBConditionalUpdate:
+    """update_job_status is conditional by default and raises JobStateConflict
+    when DynamoDB reports ConditionalCheckFailedException."""
 
     @given(
         job_id=_job_id,
         user_id=_user_id,
-        status=_status,
+        new_status=st.sampled_from(["COMPLETE", "FAILED", "CANCELLED"]),
+        expected=st.sampled_from(sorted(VALID_STATES)),
     )
-    @settings(max_examples=100, deadline=10_000)
+    @settings(max_examples=50, deadline=10_000)
     @pytest.mark.asyncio
-    async def test_write_gsi1pk_matches_status(self, job_id, user_id, status):
-        """For any write, if GSI1PK is present it SHALL equal
-        status#{current_status}."""
-        captured_items: list[dict] = []
-
-        mock_table = MagicMock()
-        mock_table.put_item = lambda **kwargs: captured_items.append(kwargs["Item"])
-
+    async def test_explicit_expected_status_is_forwarded(
+        self, job_id, user_id, new_status, expected
+    ):
+        """Any explicit expected_status lands in ':expected'."""
+        mock_table, captured = _mock_table_with_record(job_id, user_id)
         with patch("container.lib.dynamodb_helpers._get_ddb") as mock_ddb:
             mock_ddb.return_value.Table.return_value = mock_table
-
-            await write_job_record(
-                job_id=job_id,
-                user_id=user_id,
-                status=status,
+            await update_job_status(
+                job_id=job_id, user_id=user_id, status=new_status,
+                expected_status=expected, completed_at="2024-01-01T00:00:01",
             )
-
-        assert len(captured_items) == 1
-        item = captured_items[0]
-
-        # GSI1PK check (will be present after Task 5)
-        if "GSI1PK" in item:
-            assert item["GSI1PK"] == f"status#{status}", (
-                f"GSI1PK mismatch: expected 'status#{status}', "
-                f"got {item['GSI1PK']!r}"
-            )
-
-        # GSI1SK check: should equal created_at timestamp
-        if "GSI1SK" in item:
-            assert item["GSI1SK"] == item["created_at"], (
-                f"GSI1SK mismatch: expected {item['created_at']!r}, "
-                f"got {item['GSI1SK']!r}"
-            )
+        assert len(captured) == 1
+        assert captured[0]["ConditionExpression"] == "#st = :expected"
+        assert captured[0]["ExpressionAttributeValues"][":expected"] == expected
 
     @given(
         job_id=_job_id,
         user_id=_user_id,
         new_status=st.sampled_from(["COMPLETE", "FAILED", "CANCELLED"]),
     )
-    @settings(max_examples=100, deadline=10_000)
+    @settings(max_examples=50, deadline=10_000)
     @pytest.mark.asyncio
-    async def test_update_gsi1pk_matches_new_status(self, job_id, user_id, new_status):
-        """For any update, if GSI1PK is in the update expression it SHALL
-        equal status#{new_status}."""
-        existing_sk = f"job#{job_id}#2024-01-01T00:00:00+00:00"
-        existing_item = {
-            "PK": f"user#{user_id}",
-            "SK": existing_sk,
-            "job_id": job_id,
-            "user_id": user_id,
-            "status": "RUNNING",
-        }
-
-        captured_updates: list[dict] = []
-
-        mock_table = MagicMock()
-        mock_table.query = lambda **kwargs: {"Items": [existing_item]}
-        mock_table.update_item = lambda **kwargs: captured_updates.append(kwargs)
-
+    async def test_expected_status_none_is_unconditional(
+        self, job_id, user_id, new_status
+    ):
+        """expected_status=None omits ConditionExpression and ':expected'."""
+        mock_table, captured = _mock_table_with_record(job_id, user_id)
         with patch("container.lib.dynamodb_helpers._get_ddb") as mock_ddb:
             mock_ddb.return_value.Table.return_value = mock_table
-
             await update_job_status(
-                job_id=job_id,
-                user_id=user_id,
-                status=new_status,
+                job_id=job_id, user_id=user_id, status=new_status,
+                expected_status=None, completed_at="2024-01-01T00:00:01",
+            )
+        assert len(captured) == 1
+        assert "ConditionExpression" not in captured[0]
+        assert ":expected" not in captured[0]["ExpressionAttributeValues"]
+
+    @given(
+        job_id=_job_id,
+        user_id=_user_id,
+        new_status=st.sampled_from(["COMPLETE", "FAILED", "CANCELLED"]),
+    )
+    @settings(max_examples=50, deadline=10_000)
+    @pytest.mark.asyncio
+    async def test_conditional_check_failure_raises_job_state_conflict(
+        self, job_id, user_id, new_status
+    ):
+        """ConditionalCheckFailedException -> JobStateConflict (chained)."""
+        mock_table, _captured = _mock_table_with_record(job_id, user_id, "CANCELLED")
+
+        def _refuse(**kwargs):
+            raise ClientError(
+                {
+                    "Error": {
+                        "Code": "ConditionalCheckFailedException",
+                        "Message": "The conditional request failed",
+                    }
+                },
+                "UpdateItem",
             )
 
-        assert len(captured_updates) == 1
-        update_call = captured_updates[0]
-        attr_values = update_call.get("ExpressionAttributeValues", {})
+        mock_table.update_item = _refuse
+        with patch("container.lib.dynamodb_helpers._get_ddb") as mock_ddb:
+            mock_ddb.return_value.Table.return_value = mock_table
+            with pytest.raises(JobStateConflict) as excinfo:
+                await update_job_status(
+                    job_id=job_id, user_id=user_id, status=new_status,
+                    completed_at="2024-01-01T00:00:01",
+                )
+        assert job_id in str(excinfo.value)
+        assert "RUNNING" in str(excinfo.value)
+        assert isinstance(excinfo.value.__cause__, ClientError)
 
-        # GSI1PK check (will be present after Task 5)
-        if ":gsi1pk" in attr_values:
-            assert attr_values[":gsi1pk"] == f"status#{new_status}", (
-                f"GSI1PK update mismatch: expected 'status#{new_status}', "
-                f"got {attr_values[':gsi1pk']!r}"
+    @pytest.mark.asyncio
+    async def test_other_client_errors_propagate_unchanged(self):
+        """Non-conditional ClientErrors are re-raised as-is."""
+        mock_table, _captured = _mock_table_with_record("job1", "user1")
+
+        def _throttle(**kwargs):
+            raise ClientError(
+                {"Error": {"Code": "ProvisionedThroughputExceededException",
+                           "Message": "slow down"}},
+                "UpdateItem",
             )
+
+        mock_table.update_item = _throttle
+        with patch("container.lib.dynamodb_helpers._get_ddb") as mock_ddb:
+            mock_ddb.return_value.Table.return_value = mock_table
+            with pytest.raises(ClientError) as excinfo:
+                await update_job_status(
+                    job_id="job1", user_id="user1", status="COMPLETE",
+                )
+        assert excinfo.value.response["Error"]["Code"] == (
+            "ProvisionedThroughputExceededException"
+        )

@@ -3,8 +3,8 @@
 """MCP-agnostic coding pipeline.
 
 Single source of truth for the 5-step coding pipeline
-(`resolve_git_credential` -> `git_clone` -> `run_opencode_acp_impl` ->
-`scan_and_strip_credentials_impl` -> `git_push_and_create_pr`) plus the
+(`resolve_git_credential` -> `git_clone` -> `run_opencode_acp` ->
+`scan_and_strip_credentials` -> `git_push_and_create_pr`) plus the
 surrounding DynamoDB bookkeeping, OpenTelemetry metrics, OAuth retry, and
 cooperative cancellation.
 
@@ -31,11 +31,17 @@ from typing import Awaitable, Callable, Literal, NotRequired, Optional, TypedDic
 from container.tools import (
     resolve_git_credential,
     git_clone,
-    run_opencode_acp_impl,
-    scan_and_strip_credentials_impl,
+    run_opencode_acp,
+    scan_and_strip_credentials,
     git_push_and_create_pr,
 )
-from container.lib.dynamodb_helpers import write_job_record, update_job_status
+from container.lib.dynamodb_helpers import (
+    JobStateConflict,
+    query_job_record,
+    update_job_status,
+    write_job_record,
+)
+from container.lib.git_safety import read_git_config, restore_git_config
 from container.lib.metrics import record_metric, record_histogram
 from container.lib.credential_errors import GIT_HOST_NOT_CONNECTED_MESSAGE
 
@@ -55,7 +61,9 @@ class RunPipelineResult(TypedDict):
 
     status: Literal["complete", "failed", "cancelled"]
     duration_seconds: float
-    # Present on success only:
+    # Present on success only (``pr_url`` is also present when the job
+    # was cancelled externally after the push already happened, so the
+    # caller can surface the PR that may exist):
     pr_url: NotRequired[str]
     stop_reason: NotRequired[str]
     files_edited: NotRequired[list[str]]
@@ -110,11 +118,37 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-# Schemes we accept for ``repo_url``. ``https://`` is the pipeline's
-# only tested path; ``git@`` SSH is included because the clone helper
-# forwards it to git directly, but see the hardening note in
-# ``docs/HARDENING.md`` about egress filtering.
-_ALLOWED_REPO_SCHEMES = ("https://", "git@")
+async def _ensure_still_running(job_id: str, user_id: str) -> None:
+    """Re-read the job record and abort if it is no longer ``RUNNING``.
+
+    ``cancel_task`` on another microVM records ``CANCELLED`` after a
+    successful ``StopRuntimeSession``; if this microVM is still alive at
+    that moment (the stop is asynchronous), the record is the only signal
+    it has. Called immediately before the push step so a cancelled job
+    never opens a PR. A missing record (``None``) is treated as still
+    running; a read that raises propagates to the pipeline's generic
+    error handler and fails the job like any other step error.
+    """
+    rec = await query_job_record(job_id=job_id, user_id=user_id)
+    if rec is not None and rec.get("status") != "RUNNING":
+        logger.info(
+            "job %s is %s before push; skipping push", job_id, rec.get("status")
+        )
+        raise asyncio.CancelledError()
+
+
+# Schemes we accept for ``repo_url``. HTTPS only: the whole pipeline
+# assumes an HTTPS transport. The OAuth token is supplied over HTTPS via
+# the GIT_ASKPASS mechanism, the push URL is derived by rewriting the
+# ``https://`` prefix, and the GitHub PR parser only recognises the HTTPS
+# URL shape. An ``git@`` SSH value would bypass all of those controls (the
+# token path, the hardened push URL, and PR creation), so it is rejected
+# rather than silently falling back to an unconstrained SSH transport.
+# HTTPS-only also matches the network boundary: the Runtime security group
+# allows outbound TCP 443 only, so SSH (port 22) would not connect anyway.
+# The git subprocesses enforce the same rule with GIT_ALLOW_PROTOCOL=https
+# (see ``container.lib.git_safety``).
+_ALLOWED_REPO_SCHEMES = ("https://",)
 
 # Characters that must never appear in a ``repo_url`` or a git ref,
 # even though ``subprocess.run`` uses list-form argv. Blocking them
@@ -217,6 +251,10 @@ async def run_coding_pipeline(
     _validate_git_ref(base_branch, "base_branch")
     if target_branch:
         _validate_git_ref(target_branch, "target_branch")
+        # A target branch equal to the base branch would push commits
+        # straight onto the base.
+        if target_branch == base_branch:
+            raise ValueError("target_branch must differ from base_branch")
 
     start_time = time.time()
 
@@ -289,24 +327,53 @@ async def run_coding_pipeline(
             capture_output=True,
         )
 
+        # Capture the base branch tip BEFORE OpenCode runs. The new branch
+        # points at the same commit as the base tip until OpenCode commits,
+        # so ``git rev-parse HEAD`` here is the base SHA. The scan and push
+        # steps diff against this to catch agent self-commits.
+        base_sha_result = await asyncio.to_thread(
+            subprocess.run,
+            ["git", "rev-parse", "HEAD"],
+            cwd=work_dir,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        base_sha = base_sha_result.stdout.strip()
+
+        # Snapshot .git/config as clone + config + checkout left it. OpenCode
+        # can edit anything under .git/ while it runs; the snapshot is
+        # written back before the scan and push steps.
+        git_config_snapshot = await asyncio.to_thread(read_git_config, work_dir)
+
         # -- Check-point 3: before OpenCode --------------------------------
         _check_cancel(cancel_flag)
         await _emit_progress(on_progress, 2, 5, "Running OpenCode...")
 
-        oc_result = await run_opencode_acp_impl(
+        oc_result = await run_opencode_acp(
             work_dir=work_dir,
             task_description=task_description,
             timeout_seconds=timeout_minutes * 60,
         )
 
+        # OpenCode's process group has been killed, so the restore discards
+        # any repository-local config it added (remotes, url.*.insteadOf,
+        # include.path, ...).
+        await asyncio.to_thread(restore_git_config, work_dir, git_config_snapshot)
+
         # -- Check-point 4: before credential scan -------------------------
         _check_cancel(cancel_flag)
         await _emit_progress(on_progress, 3, 5, "Scanning for credentials...")
 
-        scan_and_strip_credentials_impl(work_dir=work_dir, job_id=job_id)
+        scan_and_strip_credentials(
+            work_dir=work_dir, job_id=job_id, base_sha=base_sha
+        )
 
         # -- Check-point 5: before push + PR -------------------------------
         _check_cancel(cancel_flag)
+        # Cross-session cancellation lands in DynamoDB, not in cancel_flag;
+        # re-read the record so a cancelled job never pushes a branch.
+        await _ensure_still_running(job_id, user_id)
         await _emit_progress(on_progress, 4, 5, "Pushing changes...")
 
         push_result = await asyncio.to_thread(
@@ -318,6 +385,7 @@ async def run_coding_pipeline(
             base_branch=base_branch,
             task_description=task_description,
             job_id=job_id,
+            base_sha=base_sha,
         )
 
         # -- Terminal success path ----------------------------------------
@@ -331,12 +399,34 @@ async def run_coding_pipeline(
                 job_id=job_id,
                 user_id=user_id,
                 status="COMPLETE",
+                # Conditional: refuse to overwrite a CANCELLED row written
+                # by cancel_task on another microVM (raises JobStateConflict).
+                expected_status="RUNNING",
                 pr_url=pr_url,
                 stop_reason=stop_reason,
                 files_edited=files_edited,
                 duration_seconds=round(duration, 2),
                 completed_at=_now_iso(),
             )
+        except JobStateConflict:
+            # cancel_task won the race: the record is already CANCELLED
+            # (conditional write refused to overwrite it). The push may
+            # already have created a PR; report it rather than hide it.
+            logger.warning(
+                "Job %s left RUNNING before COMPLETE was recorded "
+                "(cancelled externally); PR may already exist: %s",
+                job_id, pr_url,
+            )
+            record_metric(f"{metric_prefix}.cancelled", 1.0)
+            return {
+                "status": "cancelled",
+                "error": (
+                    f"Task cancelled while completing; PR may exist: {pr_url}"
+                    if pr_url else "Task cancelled while completing"
+                ),
+                "pr_url": pr_url,
+                "duration_seconds": round(duration, 2),
+            }
         except Exception:
             logger.exception(
                 "Failed to write COMPLETE audit record for job %s", job_id
@@ -362,9 +452,15 @@ async def run_coding_pipeline(
                 job_id=job_id,
                 user_id=user_id,
                 status="CANCELLED",
+                expected_status="RUNNING",
                 error="Task cancelled",
                 duration_seconds=round(duration, 2),
                 completed_at=_now_iso(),
+            )
+        except JobStateConflict:
+            # Already terminal (cancel_task recorded CANCELLED first).
+            logger.info(
+                "Job %s already terminal; CANCELLED write skipped", job_id
             )
         except Exception:
             logger.exception(
@@ -388,9 +484,15 @@ async def run_coding_pipeline(
                 job_id=job_id,
                 user_id=user_id,
                 status="FAILED",
+                expected_status="RUNNING",
                 error=error_msg,
                 duration_seconds=round(duration, 2),
                 completed_at=_now_iso(),
+            )
+        except JobStateConflict:
+            # Already terminal (cancel_task recorded CANCELLED first).
+            logger.info(
+                "Job %s already terminal; FAILED write skipped", job_id
             )
         except Exception:
             logger.exception(

@@ -14,7 +14,17 @@ import subprocess
 from pathlib import Path
 from typing import TypedDict
 
+from container.lib.git_safety import GIT_HARDEN_ARGS, hardened_git_env
+
 logger = logging.getLogger(__name__)
+
+# Hardening flags applied to every git invocation run against the
+# post-agent repository. The pipeline restores ``.git/config`` before the
+# scan, but ``.git/hooks`` and ``~/.gitconfig`` may still have been
+# changed, and index-refreshing commands such as ``git diff`` can otherwise
+# consult a planted fsmonitor. These are the same flags and env the push
+# step uses (see ``container.lib.git_safety``).
+_HARDEN = list(GIT_HARDEN_ARGS)
 
 PATTERNS = [
     ("AWS Access Key", re.compile(r"AKIA[0-9A-Z]{16}")),
@@ -42,26 +52,67 @@ class ScanResult(TypedDict):
     findings: list[dict]
 
 
-def _get_modified_files(work_dir: str) -> list[str]:
-    """Return list of modified file paths relative to *work_dir* using git."""
-    result = subprocess.run(
-        ["git", "diff", "--name-only", "HEAD"],
+def _get_scan_files(work_dir: str, base_sha: str | None = None) -> list[str]:
+    """Return file paths to scan, relative to *work_dir*, using git.
+
+    Unions three sources so nothing an agent produced slips through:
+
+    1. Commits the agent made itself: the diff ``base_sha..HEAD`` when a
+       ``base_sha`` is supplied (names every file changed since the base
+       branch tip, including files the agent committed). When ``base_sha``
+       is falsy, this falls back to ``git diff --name-only HEAD`` to
+       preserve the previous HEAD-based behaviour for standalone callers.
+    2. Staged and unstaged working-tree edits (``git diff --name-only
+       HEAD``) so uncommitted changes and the index are covered.
+    3. Untracked files (``git ls-files --others --exclude-standard``).
+
+    The diffs use ``--no-renames`` so the listing does not depend on rename
+    detection heuristics: every added, modified or renamed-to path is named
+    explicitly.
+    """
+    stdouts: list[str] = []
+    env = hardened_git_env()
+
+    if base_sha:
+        committed = subprocess.run(
+            ["git", *_HARDEN, "diff", "--name-only", "--no-renames",
+             f"{base_sha}..HEAD"],
+            cwd=work_dir,
+            capture_output=True,
+            text=True,
+            check=True,
+            env=env,
+        )
+        stdouts.append(committed.stdout)
+
+    # Staged + unstaged working-tree changes (also covers the index).
+    worktree = subprocess.run(
+        ["git", *_HARDEN, "diff", "--name-only", "--no-renames", "HEAD"],
         cwd=work_dir,
         capture_output=True,
         text=True,
+        check=True,
+        env=env,
     )
-    # Also include untracked files so nothing slips through
+    stdouts.append(worktree.stdout)
+
+    # Untracked files so nothing slips through.
     untracked = subprocess.run(
-        ["git", "ls-files", "--others", "--exclude-standard"],
+        ["git", *_HARDEN, "ls-files", "--others", "--exclude-standard"],
         cwd=work_dir,
         capture_output=True,
         text=True,
+        check=True,
+        env=env,
     )
+    stdouts.append(untracked.stdout)
+
     files: list[str] = []
-    for line in (result.stdout + "\n" + untracked.stdout).splitlines():
-        stripped = line.strip()
-        if stripped:
-            files.append(stripped)
+    for stdout in stdouts:
+        for line in stdout.splitlines():
+            stripped = line.strip()
+            if stripped:
+                files.append(stripped)
     # Deduplicate while preserving order
     seen: set[str] = set()
     deduped: list[str] = []
@@ -88,9 +139,18 @@ def scan_and_strip_content(content: str) -> tuple[str, list[dict]]:
     return cleaned, findings
 
 
-def scan_and_strip_credentials_impl(work_dir: str, job_id: str) -> ScanResult:
-    """Core implementation — scan modified files and strip secrets."""
-    modified_files = _get_modified_files(work_dir)
+def scan_and_strip_credentials(
+    work_dir: str, job_id: str, base_sha: str | None = None
+) -> ScanResult:
+    """Scan modified files for credential leaks and strip secrets.
+
+    Discovers changed files via the union of the ``base_sha..HEAD`` diff
+    (so agent self-commits are included), the staged/unstaged working
+    tree, and untracked files; checks each against the credential
+    patterns, replaces matches with ``<REDACTED_SECRET>``, and writes
+    back modified files.
+    """
+    modified_files = _get_scan_files(work_dir, base_sha)
     work_path = Path(work_dir)
 
     files_scanned = 0
@@ -130,12 +190,3 @@ def scan_and_strip_credentials_impl(work_dir: str, job_id: str) -> ScanResult:
         findings=all_findings,
     )
 
-
-def scan_and_strip_credentials(work_dir: str, job_id: str) -> ScanResult:
-    """Scan modified files for credential leaks and strip secrets.
-
-    Uses ``git diff --name-only HEAD`` to discover changed files, checks
-    each against four credential patterns, replaces matches with
-    ``<REDACTED_SECRET>``, and writes back modified files.
-    """
-    return scan_and_strip_credentials_impl(work_dir=work_dir, job_id=job_id)

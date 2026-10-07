@@ -106,6 +106,52 @@ class TestStateValidation:
 # Happy path (Req 3.1)
 # ---------------------------------------------------------------------------
 
+class TestLoggingHygiene:
+    """WI-7: the authorizer must never log raw session_id / state / params."""
+
+    def test_valid_request_does_not_log_session_id_or_state(self, capsys):
+        session_id = "sess-SECRET-0123456789"
+        state = json.dumps({"user_id": "user-SECRET-xyz"})
+        event = _event(session_id=session_id, state=state)
+
+        result = handler(event, None)
+        out = capsys.readouterr().out
+
+        assert result == {"isAuthorized": True}
+        assert session_id not in out
+        assert state not in out
+        assert "user-SECRET-xyz" not in out
+        assert "session_id_present=True" in out
+
+    def test_bad_state_does_not_log_raw_state(self, capsys):
+        session_id = "a" * 12
+        state = "SECRET-not-json"
+        event = _event(session_id=session_id, state=state)
+
+        result = handler(event, None)
+        out = capsys.readouterr().out
+
+        assert result == {"isAuthorized": False}
+        assert state not in out
+        assert session_id not in out
+
+    def test_state_without_user_id_denied_without_logging_state(self, capsys):
+        """The missing-user_id DENY branch logs neither the state nor its
+        parsed contents."""
+        session_id = "sess-SECRET-9876543210"
+        state = json.dumps({"other": "SECRET-other-value"})
+        event = _event(session_id=session_id, state=state)
+
+        result = handler(event, None)
+        out = capsys.readouterr().out
+
+        assert result == {"isAuthorized": False}
+        assert "DENY: state missing user_id" in out
+        assert state not in out
+        assert "SECRET-other-value" not in out
+        assert session_id not in out
+
+
 class TestHappyPath:
     def test_valid_request(self):
         event = _event(

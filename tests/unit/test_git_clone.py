@@ -123,6 +123,37 @@ class TestGitCloneAskpass:
     @patch("container.tools.git_clone._create_askpass_script", return_value="/tmp/fake_askpass.sh")
     @patch("container.tools.git_clone.os.path.exists", return_value=True)
     @patch("container.tools.git_clone.os.remove")
+    def test_https_only_transport_on_every_call(self, mock_remove, mock_exists, mock_askpass, mock_run):
+        """GIT_ALLOW_PROTOCOL=https on the clone command."""
+        git_clone(
+            repo_url="https://github.com/owner/repo",
+            token="tok",
+            base_branch="main",
+            work_dir="/tmp/work",
+        )
+
+        assert mock_run.call_count == 1
+        assert mock_run.call_args[1]["env"]["GIT_ALLOW_PROTOCOL"] == "https"
+
+    @patch("container.tools.git_clone.subprocess.run")
+    @patch("container.tools.git_clone._create_askpass_script")
+    def test_unsupported_url_rejected_before_token_written(self, mock_askpass, mock_run):
+        """A non-https or credential-bearing URL fails before the askpass
+        script (and token sidecar) is created."""
+        import pytest
+
+        for bad in ("git@github.com:o/r.git", "https://u:p@github.com/o/r"):
+            with pytest.raises(ValueError):
+                git_clone(
+                    repo_url=bad, token="tok", base_branch="main", work_dir="/tmp/work",
+                )
+        mock_askpass.assert_not_called()
+        mock_run.assert_not_called()
+
+    @patch("container.tools.git_clone.subprocess.run")
+    @patch("container.tools.git_clone._create_askpass_script", return_value="/tmp/fake_askpass.sh")
+    @patch("container.tools.git_clone.os.path.exists", return_value=True)
+    @patch("container.tools.git_clone.os.remove")
     def test_askpass_script_cleaned_up(self, mock_remove, mock_exists, mock_askpass, mock_run):
         git_clone(
             repo_url="https://github.com/owner/repo",
@@ -141,17 +172,19 @@ class TestGitCloneAskpass:
     @patch("container.tools.git_clone.os.path.exists", return_value=True)
     @patch("container.tools.git_clone.os.remove")
     def test_askpass_cleaned_up_on_error(self, mock_remove, mock_exists, mock_askpass, mock_run):
-        mock_run.side_effect = subprocess.CalledProcessError(128, "git")
+        import pytest
 
-        try:
+        cause = subprocess.CalledProcessError(128, "git")
+        mock_run.side_effect = cause
+
+        with pytest.raises(RuntimeError) as exc_info:
             git_clone(
                 repo_url="https://github.com/owner/repo",
                 token="tok",
                 base_branch="main",
                 work_dir="/tmp/work",
             )
-        except subprocess.CalledProcessError:
-            pass
+        assert exc_info.value.__cause__ is cause
 
         assert mock_remove.call_count == 2
         removed_paths = [call[0][0] for call in mock_remove.call_args_list]
@@ -160,7 +193,7 @@ class TestGitCloneAskpass:
 
 
 class TestGitCloneBasic:
-    """Test basic shallow clone without sparse checkout."""
+    """Test the shallow clone command."""
 
     @patch("container.tools.git_clone.subprocess.run")
     @patch("container.tools.git_clone._create_askpass_script", return_value="/tmp/fake_askpass.sh")
@@ -213,140 +246,100 @@ class TestGitCloneBasic:
     @patch("container.tools.git_clone.os.path.exists", return_value=True)
     @patch("container.tools.git_clone.os.remove")
     def test_propagates_subprocess_error(self, mock_remove, mock_exists, mock_askpass, mock_run):
-        mock_run.side_effect = subprocess.CalledProcessError(128, "git")
+        """A failed clone surfaces as RuntimeError chained from the
+        CalledProcessError (not the raw CalledProcessError repr)."""
+        import pytest
 
-        try:
+        cause = subprocess.CalledProcessError(128, "git")
+        mock_run.side_effect = cause
+
+        with pytest.raises(RuntimeError) as exc_info:
             git_clone(
                 repo_url="https://github.com/o/r",
                 token="t",
                 base_branch="main",
                 work_dir="/w",
             )
-            assert False, "Should have raised CalledProcessError"
-        except subprocess.CalledProcessError:
-            pass
+        assert exc_info.value.__cause__ is cause
 
 
-class TestGitCloneSparseCheckout:
-    """Test sparse checkout path."""
+class TestGitCloneErrorMessages:
+    """git clone failures are translated into user-facing messages."""
 
-    @patch("container.tools.git_clone.subprocess.run")
-    @patch("container.tools.git_clone._create_askpass_script", return_value="/tmp/fake_askpass.sh")
-    @patch("container.tools.git_clone.os.path.exists", return_value=True)
-    @patch("container.tools.git_clone.os.remove")
-    def test_sparse_clone_runs_three_commands(self, mock_remove, mock_exists, mock_askpass, mock_run):
-        git_clone(
-            repo_url="https://github.com/owner/repo",
-            token="tok",
-            base_branch="main",
-            work_dir="/tmp/work",
-            sparse_paths=["src/", "lib/"],
-        )
+    def _run(self, mock_run, stderr, base_branch="main"):
+        import pytest
 
-        assert mock_run.call_count == 3
+        mock_run.side_effect = subprocess.CalledProcessError(128, "git", stderr=stderr)
+        with pytest.raises(RuntimeError) as exc_info:
+            git_clone(
+                repo_url="https://github.com/owner/repo",
+                token="ghp_secret",
+                base_branch=base_branch,
+                work_dir="/tmp/work",
+            )
+        return str(exc_info.value)
 
     @patch("container.tools.git_clone.subprocess.run")
     @patch("container.tools.git_clone._create_askpass_script", return_value="/tmp/fake_askpass.sh")
     @patch("container.tools.git_clone.os.path.exists", return_value=True)
     @patch("container.tools.git_clone.os.remove")
-    def test_sparse_clone_first_command_uses_filter_and_no_checkout(self, mock_remove, mock_exists, mock_askpass, mock_run):
-        git_clone(
-            repo_url="https://github.com/owner/repo",
-            token="tok",
-            base_branch="main",
-            work_dir="/tmp/work",
-            sparse_paths=["src/"],
+    def test_missing_base_branch(self, mock_remove, mock_exists, mock_askpass, mock_run):
+        msg = self._run(
+            mock_run,
+            b"fatal: Remote branch test20261007a not found in upstream origin\n",
+            base_branch="test20261007a",
         )
-
-        first_call_args = mock_run.call_args_list[0][0][0]
-        assert "--filter=blob:none" in first_call_args
-        assert "--no-checkout" in first_call_args
-        assert "--depth" in first_call_args
+        assert msg == (
+            "base_branch 'test20261007a' not found on remote "
+            "https://github.com/owner/repo"
+        )
 
     @patch("container.tools.git_clone.subprocess.run")
     @patch("container.tools.git_clone._create_askpass_script", return_value="/tmp/fake_askpass.sh")
     @patch("container.tools.git_clone.os.path.exists", return_value=True)
     @patch("container.tools.git_clone.os.remove")
-    def test_sparse_checkout_set_includes_paths(self, mock_remove, mock_exists, mock_askpass, mock_run):
-        git_clone(
-            repo_url="https://github.com/owner/repo",
-            token="tok",
-            base_branch="main",
-            work_dir="/tmp/work",
-            sparse_paths=["src/", "docs/"],
+    def test_repository_not_found(self, mock_remove, mock_exists, mock_askpass, mock_run):
+        msg = self._run(mock_run, b"remote: Repository not found.\nfatal: repository not found\n")
+        assert msg == (
+            "repository https://github.com/owner/repo not found or access "
+            "denied for the connected git account"
         )
-
-        second_call = mock_run.call_args_list[1]
-        args = second_call[0][0]
-        assert args == ["git", "sparse-checkout", "set", "src/", "docs/"]
-        assert second_call[1]["cwd"] == "/tmp/work"
 
     @patch("container.tools.git_clone.subprocess.run")
     @patch("container.tools.git_clone._create_askpass_script", return_value="/tmp/fake_askpass.sh")
     @patch("container.tools.git_clone.os.path.exists", return_value=True)
     @patch("container.tools.git_clone.os.remove")
-    def test_sparse_checkout_final_command_is_checkout(self, mock_remove, mock_exists, mock_askpass, mock_run):
-        git_clone(
-            repo_url="https://github.com/owner/repo",
-            token="tok",
-            base_branch="main",
-            work_dir="/tmp/work",
-            sparse_paths=["src/"],
-        )
-
-        third_call = mock_run.call_args_list[2]
-        assert third_call[0][0] == ["git", "checkout"]
-        assert third_call[1]["cwd"] == "/tmp/work"
+    def test_authentication_failed_str_stderr(self, mock_remove, mock_exists, mock_askpass, mock_run):
+        # stderr may already be str when text mode is used
+        msg = self._run(mock_run, "fatal: Authentication failed for 'https://github.com/owner/repo/'\n")
+        assert "not found or access denied" in msg
 
     @patch("container.tools.git_clone.subprocess.run")
     @patch("container.tools.git_clone._create_askpass_script", return_value="/tmp/fake_askpass.sh")
     @patch("container.tools.git_clone.os.path.exists", return_value=True)
     @patch("container.tools.git_clone.os.remove")
-    def test_no_sparse_when_paths_is_none(self, mock_remove, mock_exists, mock_askpass, mock_run):
-        git_clone(
-            repo_url="https://github.com/owner/repo",
-            token="tok",
-            base_branch="main",
-            work_dir="/tmp/work",
-            sparse_paths=None,
+    def test_generic_failure_includes_exit_code_and_stderr_tail(
+        self, mock_remove, mock_exists, mock_askpass, mock_run
+    ):
+        msg = self._run(mock_run, b"fatal: unable to access: Could not resolve host\n")
+        assert msg == (
+            "git clone failed (exit 128): fatal: unable to access: Could not resolve host"
         )
-
-        assert mock_run.call_count == 1
-        args = mock_run.call_args[0][0]
-        assert "--filter=blob:none" not in args
-        assert "--no-checkout" not in args
 
     @patch("container.tools.git_clone.subprocess.run")
     @patch("container.tools.git_clone._create_askpass_script", return_value="/tmp/fake_askpass.sh")
     @patch("container.tools.git_clone.os.path.exists", return_value=True)
     @patch("container.tools.git_clone.os.remove")
-    def test_sparse_all_commands_get_askpass_env(self, mock_remove, mock_exists, mock_askpass, mock_run):
-        git_clone(
-            repo_url="https://github.com/owner/repo",
-            token="tok",
-            base_branch="main",
-            work_dir="/tmp/work",
-            sparse_paths=["src/"],
-        )
-
-        for call_obj in mock_run.call_args_list:
-            env = call_obj[1]["env"]
-            assert "GIT_ASKPASS" in env
+    def test_generic_failure_truncates_long_stderr(
+        self, mock_remove, mock_exists, mock_askpass, mock_run
+    ):
+        msg = self._run(mock_run, b"x" * 1000)
+        assert msg == "git clone failed (exit 128): " + "x" * 300
 
     @patch("container.tools.git_clone.subprocess.run")
     @patch("container.tools.git_clone._create_askpass_script", return_value="/tmp/fake_askpass.sh")
     @patch("container.tools.git_clone.os.path.exists", return_value=True)
     @patch("container.tools.git_clone.os.remove")
-    def test_sparse_token_not_in_any_command_args(self, mock_remove, mock_exists, mock_askpass, mock_run):
-        token = "ghp_supersecret123"
-        git_clone(
-            repo_url="https://github.com/owner/repo",
-            token=token,
-            base_branch="main",
-            work_dir="/tmp/work",
-            sparse_paths=["src/"],
-        )
-
-        for call_obj in mock_run.call_args_list:
-            for arg in call_obj[0][0]:
-                assert token not in arg
+    def test_no_stderr(self, mock_remove, mock_exists, mock_askpass, mock_run):
+        msg = self._run(mock_run, None)
+        assert msg == "git clone failed (exit 128): "

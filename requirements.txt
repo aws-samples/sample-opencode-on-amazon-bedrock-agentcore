@@ -8,4 +8,7 @@ aws-cdk.aws-bedrock-agentcore-alpha>=2.251.0a0,<2.252.0a0
 cdk-nag>=2.38.2,<3.0.0
 constructs>=10.6.0,<11.0.0
 hypothesis>=6.152.4,<7.0.0
+# Test-only: evaluates the real Cedar policies from scripts/create-policies.py
+# in tests/property/test_cedar_role_enforcement.py.
+cedarpy==4.12.1
 httpx>=0.28.1

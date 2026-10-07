@@ -74,8 +74,9 @@ class TestColdStartWeightEstimation:
     def test_opencode_dockerfile_installs_opencode(self):
         """OpenCode Dockerfile installs the OpenCode CLI.
 
-        The install method has changed over time. Current: official
-        curl installer from opencode.ai (simplest path).
+        The install method has changed over time. Current: the pinned GitHub
+        release asset, verified against a per-architecture SHA-256 (see
+        ``test_opencode_download_is_pinned_and_verified``).
         """
         import pathlib
         dockerfile = pathlib.Path("container/Dockerfile").read_text()
@@ -84,4 +85,24 @@ class TestColdStartWeightEstimation:
         )
         assert "OPENCODE_BINARY" in dockerfile, (
             "Dockerfile should set OPENCODE_BINARY env var"
+        )
+
+    def test_opencode_download_is_pinned_and_verified(self):
+        """The OpenCode download is pinned to a version and an arm64 SHA-256,
+        verified before install, and not piped into a shell."""
+        import pathlib
+        import re
+        dockerfile = pathlib.Path("container/Dockerfile").read_text()
+        # Instructions only; comments may mention what is not done.
+        instructions = "\n".join(
+            line for line in dockerfile.splitlines()
+            if not line.lstrip().startswith("#")
+        )
+        assert "ARG OPENCODE_VERSION=1.18.34" in instructions
+        assert re.search(
+            r"^ARG OPENCODE_SHA256_ARM64=[0-9a-f]{64}$", instructions, re.MULTILINE
+        ), "Dockerfile should pin a SHA-256 for the arm64 asset"
+        assert "sha256sum -c" in instructions
+        assert not re.search(r"curl[^\n]*\|\s*(ba)?sh", instructions), (
+            "Dockerfile should not pipe a download into a shell"
         )

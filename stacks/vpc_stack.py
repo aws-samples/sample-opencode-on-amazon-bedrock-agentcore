@@ -6,8 +6,8 @@ Requirements: 8, 10.1
 - Private subnets with no direct internet access; NAT Gateway for outbound
 - S3 + DynamoDB gateway endpoints (free)
 - Interface endpoints for all services called from within the VPC:
-  ECR, CloudWatch Logs, CloudWatch Monitoring, KMS, STS,
-  Secrets Manager, Lambda, Bedrock, Bedrock AgentCore, X-Ray
+  ECR (api + dkr), CloudWatch Logs, CloudWatch Monitoring, KMS,
+  Secrets Manager, Bedrock, Bedrock AgentCore, X-Ray
 """
 
 import aws_cdk as cdk
@@ -131,12 +131,8 @@ class VpcStack(cdk.Stack):
             "CwMonitoring": ec2.InterfaceVpcEndpointAwsService.CLOUDWATCH_MONITORING,
             # KMS — CMK encrypt/decrypt for S3, DynamoDB, Secrets Manager
             "Kms": ec2.InterfaceVpcEndpointAwsService.KMS,
-            # STS — AgentCore per-task scoped credential assumption
-            "Sts": ec2.InterfaceVpcEndpointAwsService.STS,
             # Secrets Manager — Identity token vault (OAuth tokens)
             "SecretsManager": ec2.InterfaceVpcEndpointAwsService.SECRETS_MANAGER,
-            # Lambda — Lambda API calls from AgentCore runtime
-            "Lambda": ec2.InterfaceVpcEndpointAwsService.LAMBDA_,
             # Bedrock — InvokeModel / InvokeModelWithResponseStream
             "Bedrock": ec2.InterfaceVpcEndpointAwsService.BEDROCK_RUNTIME,
             # X-Ray — distributed tracing from AgentCore containers

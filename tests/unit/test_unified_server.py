@@ -59,16 +59,12 @@ def _build_gateway_template() -> assertions.Template:
         callback_url="https://test.execute-api.us-east-1.amazonaws.com/callback",
         env=env,
     )
-    stub_policy_engine_arn = (
-        "arn:aws:bedrock-agentcore:us-east-1:123456789012:policy-engine/STUB000001"
-    )
     stack = GatewayStack(
         app,
         "TestGateway",
         cognito_user_pool=security_stack.user_pool,
         cognito_client_id=security_stack.user_pool_client.user_pool_client_id,
         opencode_runtime=agentcore_stack.runtime,
-        policy_engine_arn=stub_policy_engine_arn,
         cmk=security_stack.cmk,
         env=env,
     )

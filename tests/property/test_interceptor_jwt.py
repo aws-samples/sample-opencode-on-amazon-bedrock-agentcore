@@ -6,11 +6,14 @@
 
 Property 6 -- JWT extraction or rejection:
   For any HTTP request to the interceptor, if the Authorization header
-  contains a valid decodable JWT with a `sub` or `email` claim, the
-  interceptor SHALL extract it as `_user_id`. For any request where the
+  contains a valid decodable JWT with a `sub` claim, the interceptor SHALL
+  extract it as `_user_id`. For any `tools/call` request where the
   Authorization header is missing, empty, or contains a malformed JWT
-  (bad base64, invalid JSON, missing claims), the interceptor SHALL
+  (bad base64, invalid JSON, missing `sub`), the interceptor SHALL
   return an error response and SHALL NOT set `_user_id` to "anonymous".
+  Identity is derived from `sub` only (no email fallback), and any
+  client-supplied `_user_id` is always stripped before the server-derived
+  one is injected.
 """
 
 from __future__ import annotations
@@ -61,8 +64,17 @@ def _make_event(auth_header: str | None) -> dict:
 
 
 def _is_error_response(result: dict) -> bool:
-    """Check if the interceptor returned a 401 error response."""
-    return result.get("statusCode") == 401
+    """Check if the interceptor returned a 401 error response.
+
+    The interceptor short-circuits with an error by returning a
+    transformedGatewayResponse carrying the status code.
+    """
+    try:
+        return (
+            result["mcp"]["transformedGatewayResponse"]["statusCode"] == 401
+        )
+    except (KeyError, TypeError):
+        return False
 
 
 def _get_injected_user_id(result: dict) -> str | None:
@@ -89,14 +101,13 @@ _identifier = st.text(
     max_size=64,
 )
 
-# Valid claims: at least one of sub or email is present and non-empty
+# Valid claims: sub is present and non-empty. Identity is derived from `sub`
+# only; an email claim (if present) is never used as a fallback.
 _valid_claims = st.one_of(
-    # Both sub and email
-    st.fixed_dictionaries({"sub": _identifier, "email": _identifier}),
     # Only sub
     st.fixed_dictionaries({"sub": _identifier}),
-    # Only email
-    st.fixed_dictionaries({"email": _identifier}),
+    # sub plus an email that must be ignored
+    st.fixed_dictionaries({"sub": _identifier, "email": _identifier}),
 )
 
 # Malformed JWT strings that should cause decode failures
@@ -111,11 +122,18 @@ _malformed_jwt = st.one_of(
     st.just("Bearer aaa..sig"),
 )
 
-# Missing claims: valid JWT structure but no sub or email
-_missing_claims = st.fixed_dictionaries({
-    "aud": st.just("some-audience"),
-    "iss": st.just("some-issuer"),
-}).map(lambda claims: "Bearer " + _make_jwt_token(claims))
+# Missing claims: valid JWT structure but no `sub`. An email-only token is
+# included here because the email fallback has been removed — email alone is
+# no longer a valid identity.
+_missing_claims = st.one_of(
+    st.fixed_dictionaries({
+        "aud": st.just("some-audience"),
+        "iss": st.just("some-issuer"),
+    }),
+    st.fixed_dictionaries({"email": _identifier}),
+    # An empty `sub` is not an identity either.
+    st.just({"sub": ""}),
+).map(lambda claims: "Bearer " + _make_jwt_token(claims))
 
 # Missing or empty Authorization header
 _missing_auth = st.one_of(
@@ -137,8 +155,9 @@ class TestInterceptorJwt:
     @given(claims=_valid_claims)
     @settings(max_examples=100, deadline=5_000)
     def test_valid_jwt_extracts_user_id(self, claims: dict):
-        """For any valid JWT with sub or email, the interceptor SHALL extract
-        the claim as _user_id and return a transformed request (not an error).
+        """For any valid JWT with a sub claim, the interceptor SHALL extract
+        `sub` as _user_id and return a transformed request (not an error).
+        An email claim, if present, is ignored.
 
         **Validates: Requirements 4.1**
         """
@@ -151,9 +170,9 @@ class TestInterceptorJwt:
             f"Valid JWT with claims {claims} returned error: {result}"
         )
 
-        # Should have extracted user_id
+        # Should have extracted user_id from `sub` only (no email fallback)
         user_id = _get_injected_user_id(result)
-        expected = claims.get("sub") or claims.get("email")
+        expected = claims.get("sub")
         assert user_id == expected, (
             f"Expected user_id={expected!r}, got {user_id!r} for claims {claims}"
         )

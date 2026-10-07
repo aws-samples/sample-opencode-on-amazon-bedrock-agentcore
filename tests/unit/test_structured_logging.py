@@ -1,140 +1,180 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: MIT-0
-"""Unit tests for structured JSON logging configuration.
-
-Requirements: 10.1, 10.2
-Validates that the MCP server emits JSON-formatted log lines with the
-expected fields: timestamp, level, logger, message, and optional context.
+"""Logging hygiene tests for the OAuth callback handler and the callback
+API authorizer: no sensitive values are logged, HTML output is escaped, and
+security headers are set.
 """
 
+import importlib.util
 import json
-import io
-import logging
-
-from pythonjsonlogger import json as jsonlogger
+from pathlib import Path
+from unittest.mock import patch
 
 
-def _make_json_logger(stream: io.StringIO) -> logging.Logger:
-    """Create a logger configured with JsonFormatter writing to the given stream."""
-    handler = logging.StreamHandler(stream)
-    formatter = jsonlogger.JsonFormatter(
-        fmt="%(asctime)s %(levelname)s %(name)s %(message)s",
-        rename_fields={"asctime": "timestamp", "levelname": "level", "name": "logger"},
-    )
-    handler.setFormatter(formatter)
-
-    test_logger = logging.getLogger("test_structured_logging")
-    test_logger.handlers = [handler]
-    test_logger.setLevel(logging.INFO)
-    test_logger.propagate = False
-    return test_logger
+# ---------------------------------------------------------------------------
+# Load the OAuth callback handler from lambda/oauth_callback/index.py.
+# "lambda" is a Python keyword so the directory cannot be imported as a
+# normal package — load it directly from its file path.
+# ---------------------------------------------------------------------------
+_CALLBACK_INDEX = (
+    Path(__file__).resolve().parents[2] / "lambda" / "oauth_callback" / "index.py"
+)
+_spec = importlib.util.spec_from_file_location("oauth_callback_index", _CALLBACK_INDEX)
+oauth_callback = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(oauth_callback)
 
 
-class TestLogOutputIsValidJSON:
-    """Verify that log output is valid JSON."""
+# ---------------------------------------------------------------------------
+# WI-7: OAuth callback handler logging hygiene (no sensitive values logged)
+# ---------------------------------------------------------------------------
 
-    def test_info_message_is_valid_json(self):
-        buf = io.StringIO()
-        log = _make_json_logger(buf)
-        log.info("hello world")
-
-        line = buf.getvalue().strip()
-        parsed = json.loads(line)
-        assert isinstance(parsed, dict)
-
-    def test_warning_message_is_valid_json(self):
-        buf = io.StringIO()
-        log = _make_json_logger(buf)
-        log.warning("something went wrong")
-
-        line = buf.getvalue().strip()
-        parsed = json.loads(line)
-        assert isinstance(parsed, dict)
-
-    def test_multiline_message_is_valid_json(self):
-        buf = io.StringIO()
-        log = _make_json_logger(buf)
-        log.info("line one\nline two\nline three")
-
-        line = buf.getvalue().strip()
-        parsed = json.loads(line)
-        assert "line one" in parsed["message"]
+_SENSITIVE_SESSION_ID = "sess-SECRET-0123456789abcdef"
+_SENSITIVE_USER_ID = "user-SECRET-abc"
+_SENSITIVE_STATE = json.dumps({"user_id": _SENSITIVE_USER_ID})
 
 
-class TestExpectedFields:
-    """Verify that JSON log lines contain the expected renamed fields."""
+def _invoke_callback_capture_prints(event, capsys):
+    """Invoke the callback handler and return (result, captured_stdout).
 
-    def test_contains_timestamp_field(self):
-        buf = io.StringIO()
-        log = _make_json_logger(buf)
-        log.info("test message")
-
-        parsed = json.loads(buf.getvalue().strip())
-        assert "timestamp" in parsed
-
-    def test_contains_level_field(self):
-        buf = io.StringIO()
-        log = _make_json_logger(buf)
-        log.info("test message")
-
-        parsed = json.loads(buf.getvalue().strip())
-        assert parsed["level"] == "INFO"
-
-    def test_contains_logger_field(self):
-        buf = io.StringIO()
-        log = _make_json_logger(buf)
-        log.info("test message")
-
-        parsed = json.loads(buf.getvalue().strip())
-        assert parsed["logger"] == "test_structured_logging"
-
-    def test_contains_message_field(self):
-        buf = io.StringIO()
-        log = _make_json_logger(buf)
-        log.info("test message")
-
-        parsed = json.loads(buf.getvalue().strip())
-        assert parsed["message"] == "test message"
-
-    def test_original_field_names_not_present(self):
-        buf = io.StringIO()
-        log = _make_json_logger(buf)
-        log.info("test message")
-
-        parsed = json.loads(buf.getvalue().strip())
-        # The original names should be renamed, not duplicated
-        assert "asctime" not in parsed
-        assert "levelname" not in parsed
+    The handler logs via ``print`` so stdout capture is the source of
+    truth for what would land in CloudWatch logs.
+    """
+    result = oauth_callback.handler(event, None)
+    captured = capsys.readouterr()
+    return result, captured.out
 
 
-class TestExtraContextFields:
-    """Verify that extra context fields appear as top-level keys in JSON output."""
+class TestCallbackHandlerDoesNotLogSensitiveValues:
+    """The callback handler must not print session_id, state, or raw params."""
 
-    def test_job_id_appears_as_top_level_key(self):
-        buf = io.StringIO()
-        log = _make_json_logger(buf)
-        log.info("processing job", extra={"job_id": "abc-123"})
+    def test_missing_session_id_does_not_log_state_value(self, capsys):
+        # No session_id → early return, but state is present in query params.
+        event = {"queryStringParameters": {"state": _SENSITIVE_STATE}}
+        _result, out = _invoke_callback_capture_prints(event, capsys)
 
-        parsed = json.loads(buf.getvalue().strip())
-        assert parsed["job_id"] == "abc-123"
+        assert _SENSITIVE_STATE not in out
+        assert _SENSITIVE_USER_ID not in out
+        # Presence indicators are fine.
+        assert "state_present=True" in out
 
-    def test_user_id_appears_as_top_level_key(self):
-        buf = io.StringIO()
-        log = _make_json_logger(buf)
-        log.info("user action", extra={"user_id": "user-456"})
+    def test_valid_params_do_not_log_session_id_or_state(self, capsys):
+        event = {
+            "queryStringParameters": {
+                "session_id": _SENSITIVE_SESSION_ID,
+                "state": _SENSITIVE_STATE,
+            }
+        }
 
-        parsed = json.loads(buf.getvalue().strip())
-        assert parsed["user_id"] == "user-456"
+        # Force the SigV4 / upstream call to fail fast so we only exercise
+        # the request-handling log path (no network).
+        with patch.object(
+            oauth_callback.botocore.session,
+            "get_session",
+            side_effect=RuntimeError("no creds in test"),
+        ):
+            _result, out = _invoke_callback_capture_prints(event, capsys)
 
-    def test_multiple_extra_fields(self):
-        buf = io.StringIO()
-        log = _make_json_logger(buf)
-        log.info(
-            "task complete",
-            extra={"job_id": "j-1", "user_id": "u-2", "status": "COMPLETE"},
-        )
+        assert _SENSITIVE_SESSION_ID not in out
+        assert _SENSITIVE_STATE not in out
+        assert _SENSITIVE_USER_ID not in out
+        assert "session_id_present=True" in out
+        assert "state_present=True" in out
 
-        parsed = json.loads(buf.getvalue().strip())
-        assert parsed["job_id"] == "j-1"
-        assert parsed["user_id"] == "u-2"
-        assert parsed["status"] == "COMPLETE"
+
+class TestCallbackHandlerHtmlEscaping:
+    """Interpolated values in the HTML response body must be html.escape'd."""
+
+    _INJECTION = "<script>alert('xss')</script> & \"quotes\""
+
+    def test_injected_value_is_escaped_in_response_body(self):
+        # The injection reaches the body via the error message when the
+        # user identity is derived from a non-JSON state string.
+        event = {
+            "queryStringParameters": {
+                "session_id": _SENSITIVE_SESSION_ID,
+                "state": self._INJECTION,
+            }
+        }
+        # state is not JSON → user_id = state (the raw injection), then the
+        # upstream call fails and the injection would be reflected into HTML.
+        with patch.object(
+            oauth_callback.botocore.session,
+            "get_session",
+            side_effect=RuntimeError(self._INJECTION),
+        ):
+            result = oauth_callback.handler(event, None)
+
+        body = result["body"]
+        # Raw markup must not appear; escaped entities must.
+        assert "<script>" not in body
+        assert "&lt;script&gt;" in body
+        assert "&amp;" in body
+        assert "&quot;" in body or "&#x27;" in body
+
+    def test_html_helper_escapes_directly(self):
+        resp = oauth_callback._html(400, "<b>bad</b> & 'x' \"y\"")
+        body = resp["body"]
+        assert "<b>bad</b>" not in body
+        assert "&lt;b&gt;bad&lt;/b&gt;" in body
+
+
+class TestCallbackHandlerSecurityHeaders:
+    """The callback response must carry the hardening headers."""
+
+    def test_headers_present_on_success_path(self):
+        resp = oauth_callback._html(200, "ok")
+        headers = resp["headers"]
+        assert headers["Cache-Control"] == "no-store"
+        assert headers["X-Content-Type-Options"] == "nosniff"
+
+    def test_headers_present_on_error_path(self):
+        resp = oauth_callback._html(400, "Missing session_id parameter")
+        headers = resp["headers"]
+        assert headers["Cache-Control"] == "no-store"
+        assert headers["X-Content-Type-Options"] == "nosniff"
+
+
+# ---------------------------------------------------------------------------
+# WI-7: Inline authorizer logging hygiene (no sensitive values logged)
+# ---------------------------------------------------------------------------
+
+from stacks.callback_api_stack import AUTHORIZER_LAMBDA_CODE  # noqa: E402
+
+_authorizer_ns: dict = {}
+exec(AUTHORIZER_LAMBDA_CODE, _authorizer_ns)  # noqa: S102
+_authorizer_handler = _authorizer_ns["handler"]
+
+
+class TestAuthorizerDoesNotLogSensitiveValues:
+    """The inline authorizer must not print session_id, state, or raw params."""
+
+    def test_valid_request_does_not_log_session_id_or_state(self, capsys):
+        event = {
+            "queryStringParameters": {
+                "session_id": _SENSITIVE_SESSION_ID,
+                "state": _SENSITIVE_STATE,
+            }
+        }
+        result = _authorizer_handler(event, None)
+        out = capsys.readouterr().out
+
+        assert result == {"isAuthorized": True}
+        assert _SENSITIVE_SESSION_ID not in out
+        assert _SENSITIVE_STATE not in out
+        assert _SENSITIVE_USER_ID not in out
+        assert "session_id_present=True" in out
+
+    def test_invalid_state_does_not_log_parsed_value(self, capsys):
+        secret = "SECRET-not-json-value"
+        event = {
+            "queryStringParameters": {
+                "session_id": _SENSITIVE_SESSION_ID,
+                "state": secret,
+            }
+        }
+        result = _authorizer_handler(event, None)
+        out = capsys.readouterr().out
+
+        assert result == {"isAuthorized": False}
+        assert secret not in out
+        assert _SENSITIVE_SESSION_ID not in out

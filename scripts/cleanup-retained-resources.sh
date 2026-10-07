@@ -3,9 +3,11 @@
 # SPDX-License-Identifier: MIT-0
 # cleanup-retained-resources.sh — Remove resources left behind after `cdk destroy`.
 #
-# Several resources use RETAIN removal policy to prevent accidental data loss.
-# After `cdk destroy`, these resources remain and will cause "already exists"
-# errors on the next `cdk deploy`. This script removes them.
+# The DynamoDB job table uses a RETAIN removal policy to prevent accidental
+# data loss. After `cdk destroy` it remains and will cause an "already exists"
+# error on the next `cdk deploy`. This script removes it. (CloudWatch log
+# groups are also retained but have CDK-generated names and do not collide
+# on redeploy.)
 #
 # Also cleans up security groups and subnets that fail to delete during
 # `cdk destroy` because AgentCore-managed ENIs haven't been released yet.
@@ -25,6 +27,17 @@ ACCOUNT=$(aws sts get-caller-identity --query Account --output text --region "$R
 echo "=== Cleaning up retained OpenCode resources in $REGION ($ACCOUNT) ==="
 echo ""
 
+# Cedar policies created by create-policies.py block deletion of the policy
+# engine in the OpenCodeGateway stack. Point at the flag that removes them.
+GW_STATUS=$(aws cloudformation describe-stacks --stack-name OpenCodeGateway --region "$REGION" \
+    --query 'Stacks[0].StackStatus' --output text 2>/dev/null || true)
+if [ "$GW_STATUS" = "DELETE_FAILED" ]; then
+    echo "  NOTE: OpenCodeGateway is DELETE_FAILED. If the reason is 'Policy engine still contains"
+    echo "        N policies', run: python scripts/create-policies.py --delete --region $REGION"
+    echo "        then re-run 'cdk destroy'."
+    echo ""
+fi
+
 # -----------------------------------------------------------------------
 # 1. DynamoDB table
 # -----------------------------------------------------------------------
@@ -37,34 +50,7 @@ else
 fi
 
 # -----------------------------------------------------------------------
-# 2. ECR repository
-# -----------------------------------------------------------------------
-echo ""
-echo "--- ECR ---"
-if aws ecr describe-repositories --repository-names opencode-agentcore --region "$REGION" &>/dev/null; then
-    echo "  Deleting repository: opencode-agentcore"
-    aws ecr delete-repository --repository-name opencode-agentcore --region "$REGION" --force --output text --query 'repository.repositoryName'
-else
-    echo "  Repository opencode-agentcore not found (OK)"
-fi
-
-# -----------------------------------------------------------------------
-# 3. CloudWatch log groups
-# -----------------------------------------------------------------------
-echo ""
-echo "--- CloudWatch Log Groups ---"
-for LG in /opencode/system /opencode/container; do
-    if aws logs describe-log-groups --log-group-name-prefix "$LG" --region "$REGION" \
-        --query "logGroups[?logGroupName=='$LG'].logGroupName" --output text | grep -q "$LG"; then
-        echo "  Deleting log group: $LG"
-        aws logs delete-log-group --log-group-name "$LG" --region "$REGION"
-    else
-        echo "  Log group $LG not found (OK)"
-    fi
-done
-
-# -----------------------------------------------------------------------
-# 4. Security groups (AgentCore ENIs may hold these after destroy)
+# 2. Security groups (AgentCore ENIs may hold these after destroy)
 # -----------------------------------------------------------------------
 echo ""
 echo "--- Security Groups (OpenCode tagged) ---"
@@ -99,7 +85,7 @@ else
 fi
 
 # -----------------------------------------------------------------------
-# 5. Orphaned VPCs (retained subnets prevent VPC deletion during destroy)
+# 3. Orphaned VPCs (retained subnets prevent VPC deletion during destroy)
 # -----------------------------------------------------------------------
 echo ""
 echo "--- VPCs (OpenCode tagged) ---"

@@ -486,10 +486,23 @@ class TestHealthyBusyWhileTasksActive:
         """**Validates: Requirements 15.1, 15.2**"""
         mock_app = MagicMock()
         add_calls: list[str] = []
-        complete_calls: list[str] = []
+        issued_handles: list[int] = []
+        complete_calls: list[int] = []
 
-        mock_app.add_async_task = lambda jid: add_calls.append(jid)
-        mock_app.complete_async_task = lambda jid: complete_calls.append(jid)
+        # Mirror bedrock-agentcore: add_async_task(name) -> int handle;
+        # complete_async_task(handle) must receive that exact handle.
+        def _fake_add(jid: str) -> int:
+            add_calls.append(jid)
+            handle = 1_000_000 + len(add_calls)
+            issued_handles.append(handle)
+            return handle
+
+        def _fake_complete(handle: int) -> bool:
+            complete_calls.append(handle)
+            return True
+
+        mock_app.add_async_task = _fake_add
+        mock_app.complete_async_task = _fake_complete
 
         with (
             patch("container.code_mcp_server.run_coding_pipeline", new_callable=AsyncMock),
@@ -523,9 +536,11 @@ class TestHealthyBusyWhileTasksActive:
         assert len(add_calls) == num_tasks
         assert set(add_calls) == set(spawned_job_ids)
 
-        # complete_async_task was called for every spawned task.
+        # complete_async_task was called once per task with the integer
+        # handle that add_async_task returned (never with the job_id string).
         assert len(complete_calls) == num_tasks
-        assert set(complete_calls) == set(spawned_job_ids)
+        assert sorted(complete_calls) == sorted(issued_handles)
+        assert all(isinstance(h, int) for h in complete_calls)
 
         # After completion, no jobs remain in the in-process registry.
         for jid in spawned_job_ids:

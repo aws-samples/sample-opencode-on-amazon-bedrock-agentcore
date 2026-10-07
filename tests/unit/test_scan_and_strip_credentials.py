@@ -16,8 +16,9 @@ from container.tools.scan_and_strip_credentials import (
     PATTERNS,
     PLACEHOLDER,
     ScanResult,
+    _get_scan_files,
     scan_and_strip_content,
-    scan_and_strip_credentials_impl,
+    scan_and_strip_credentials,
 )
 
 
@@ -207,7 +208,7 @@ class TestScanAndStripCredentialsTool:
         secret_file.write_text('AWS_KEY = "AKIAIOSFODNN7EXAMPLE"\n')
         subprocess.run(["git", "add", "."], cwd=str(git_repo), check=True, capture_output=True)
 
-        result = scan_and_strip_credentials_impl(
+        result = scan_and_strip_credentials(
             work_dir=str(git_repo), job_id="test-job-1"
         )
 
@@ -219,7 +220,7 @@ class TestScanAndStripCredentialsTool:
         assert "AKIAIOSFODNN7EXAMPLE" not in secret_file.read_text()
 
     def test_no_modified_files_returns_zeros(self, git_repo: Path):
-        result = scan_and_strip_credentials_impl(
+        result = scan_and_strip_credentials(
             work_dir=str(git_repo), job_id="test-job-2"
         )
         assert result["files_scanned"] == 0
@@ -231,7 +232,7 @@ class TestScanAndStripCredentialsTool:
         clean_file.write_text("x = 42\n")
         subprocess.run(["git", "add", "."], cwd=str(git_repo), check=True, capture_output=True)
 
-        result = scan_and_strip_credentials_impl(
+        result = scan_and_strip_credentials(
             work_dir=str(git_repo), job_id="test-job-3"
         )
 
@@ -244,7 +245,7 @@ class TestScanAndStripCredentialsTool:
         untracked.write_text("-----BEGIN RSA PRIVATE KEY-----\n")
         # Don't git add — file is untracked
 
-        result = scan_and_strip_credentials_impl(
+        result = scan_and_strip_credentials(
             work_dir=str(git_repo), job_id="test-job-4"
         )
 
@@ -257,7 +258,7 @@ class TestScanAndStripCredentialsTool:
         secret_file.write_text('token = "sk-abcdefghijklmnopqrstuvwx"\n')
         subprocess.run(["git", "add", "."], cwd=str(git_repo), check=True, capture_output=True)
 
-        result = scan_and_strip_credentials_impl(
+        result = scan_and_strip_credentials(
             work_dir=str(git_repo), job_id="test-job-5"
         )
 
@@ -270,9 +271,81 @@ class TestScanAndStripCredentialsTool:
         (git_repo / "c.py").write_text("more clean code\n")
         subprocess.run(["git", "add", "."], cwd=str(git_repo), check=True, capture_output=True)
 
-        result = scan_and_strip_credentials_impl(
+        result = scan_and_strip_credentials(
             work_dir=str(git_repo), job_id="test-job-6"
         )
 
         assert result["files_scanned"] >= 3
         assert result["files_modified"] == 1
+
+    def test_self_committed_secret_scanned_via_base_sha(self, git_repo: Path):
+        """A secret in an agent self-commit is caught via base_sha..HEAD.
+
+        Simulates OpenCode committing its own work: record the base tip,
+        then write a file with a planted fake AWS key, ``git add`` and
+        ``git commit`` it. With ``base_sha`` supplied the scanner diffs
+        ``base_sha..HEAD`` and finds the committed file; without it, the
+        committed (clean-tree) file is missed. The planted value is a
+        synthetic test fixture, not a real credential.
+        """
+        base_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(git_repo), check=True, capture_output=True, text=True,
+        ).stdout.strip()
+
+        fake_key = "AKIA" + "A" * 16
+        committed_file = git_repo / "committed_secret.py"
+        committed_file.write_text(f'AWS_KEY = "{fake_key}"\n')
+        subprocess.run(["git", "add", "."], cwd=str(git_repo), check=True, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "agent self-commit"],
+            cwd=str(git_repo), check=True, capture_output=True,
+        )
+
+        result = scan_and_strip_credentials(
+            work_dir=str(git_repo), job_id="test-job-7", base_sha=base_sha
+        )
+
+        # The committed-since-base file is scanned and redacted.
+        assert any(f["file"] == "committed_secret.py" for f in result["findings"])
+        cleaned = committed_file.read_text()
+        assert PLACEHOLDER in cleaned
+        assert fake_key not in cleaned
+
+    def test_scan_discovery_failure_raises(self, git_repo: Path):
+        """A failed discovery command surfaces as an error, not an empty set.
+
+        Fail-closed: if ``git diff``/``ls-files`` exits non-zero the scanner
+        must raise rather than silently reporting zero files (which could let
+        a broken scan look like a clean no-op).
+        """
+        with pytest.raises(subprocess.CalledProcessError):
+            # A bogus base_sha makes ``git diff base..HEAD`` fail.
+            _get_scan_files(str(git_repo), "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef")
+
+    def test_self_committed_secret_missed_without_base_sha(self, git_repo: Path):
+        """Without base_sha, a clean-tree self-commit is not discovered.
+
+        Documents the bug WI-2 fixes: a HEAD-only scan (legacy call) does
+        not see files whose only changes are in commits already made,
+        because the working tree is clean afterward.
+        """
+        fake_key = "AKIA" + "B" * 16
+        committed_file = git_repo / "committed_secret2.py"
+        committed_file.write_text(f'AWS_KEY = "{fake_key}"\n')
+        subprocess.run(["git", "add", "."], cwd=str(git_repo), check=True, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "agent self-commit"],
+            cwd=str(git_repo), check=True, capture_output=True,
+        )
+
+        # Legacy call without base_sha: clean tree, nothing discovered.
+        result = scan_and_strip_credentials(
+            work_dir=str(git_repo), job_id="test-job-8"
+        )
+
+        assert not any(
+            f["file"] == "committed_secret2.py" for f in result["findings"]
+        )
+        # The file retains the planted value because it was never scanned.
+        assert fake_key in committed_file.read_text()

@@ -1,7 +1,8 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: MIT-0
-"""Assert that the ``GIT_ASKPASS`` script and its sidecar token file are
-created with owner-only permission bits.
+"""Tests for the ``GIT_ASKPASS`` script: owner-only permission bits on the
+script and its sidecar token file, and byte-exact token output for shapes
+that break naive ``echo '<token>'`` quoting.
 
 The credential-vaulting story for this sample depends on the token
 never being readable by any other principal on the container (no
@@ -20,6 +21,9 @@ from __future__ import annotations
 
 import os
 import stat
+import subprocess
+
+import pytest
 
 from container.lib.git_askpass import _create_askpass_script
 
@@ -90,3 +94,34 @@ def test_askpass_script_is_owner_read_and_execute_only() -> None:
         )
     finally:
         _cleanup(script_path)
+
+
+def _run_askpass_for_token(token: str) -> subprocess.CompletedProcess:
+    """Create the askpass script, run it with bash, then clean up."""
+    script_path = _create_askpass_script(token)
+    try:
+        return subprocess.run(["bash", script_path], capture_output=True, timeout=10)
+    finally:
+        _cleanup(script_path)
+
+
+@pytest.mark.parametrize(
+    "token",
+    [
+        "ab'cd",     # embedded single quote would close a quoted literal
+        "-nfoo",     # ``echo -n`` would suppress the trailing newline
+        "-efoo\\n",  # ``echo -e`` would expand the backslash escape
+        "-Ebar",     # ``echo -E`` flag
+    ],
+    ids=["single_quote", "echo_n", "echo_e_backslash", "echo_E"],
+)
+def test_askpass_prints_token_byte_for_byte(token: str) -> None:
+    """The script prints exactly ``token + "\\n"`` on stdout and exits 0,
+    whatever the token looks like."""
+    result = _run_askpass_for_token(token)
+    assert result.returncode == 0, (
+        f"askpass must exit 0 for token {token!r}; stderr={result.stderr!r}"
+    )
+    assert result.stdout == token.encode("utf-8") + b"\n", (
+        f"askpass must print token+newline for {token!r}; stdout={result.stdout!r}"
+    )

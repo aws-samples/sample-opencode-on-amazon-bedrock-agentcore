@@ -8,9 +8,12 @@ requests through the Gateway URL. The Gateway handles SigV4 signing to
 the Runtime via GATEWAY_IAM_ROLE -- the client only needs the JWT.
 
 Auth flow:
-  1. Set a temporary password on the Pool A test user via admin_set_user_password
-  2. Authenticate with USER_PASSWORD_AUTH to get an ID token
-  3. Send requests to the Gateway URL with Authorization: Bearer <id_token>
+  1. If the Pool A test user has no custom:role, set custom:role=developer
+     (admin_get_user + admin_update_user_attributes) so it is permitted by
+     the role-gated Cedar policies under ENFORCE
+  2. Set a temporary password on the test user via admin_set_user_password
+  3. Authenticate with USER_PASSWORD_AUTH to get an ID token
+  4. Send requests to the Gateway URL with Authorization: Bearer <id_token>
 
 Checks:
   runtime_health  -- MCP initialize via Gateway, verify non-424
@@ -96,6 +99,39 @@ def get_stack_output(cfn_client, stack_name: str, output_key: str) -> str:
     raise KeyError(f"Output '{output_key}' not found in stack '{stack_name}'")
 
 
+# Role given to the smoke-test user when it has none. The Cedar permits are
+# role-gated (see scripts/create-policies.py), so a role-less user is denied
+# every tool once the Gateway runs in ENFORCE mode.
+SMOKE_TEST_ROLE = "developer"
+ROLE_ATTRIBUTE = "custom:role"
+_FULL_ACCESS_ROLES = ("admin", "developer")
+
+
+def ensure_user_role(cognito_idp, user_pool_id: str, username: str) -> None:
+    """Set ``custom:role=developer`` on the user only if it has no role.
+
+    An existing role is left unchanged so the script never raises or lowers
+    the access of an operator-managed user. A role other than admin or
+    developer is reported, because the checks below expect all six tools.
+    """
+    user = cognito_idp.admin_get_user(UserPoolId=user_pool_id, Username=username)
+    attrs = {a["Name"]: a.get("Value", "") for a in user.get("UserAttributes", [])}
+    current = attrs.get(ROLE_ATTRIBUTE, "")
+    if current:
+        if current not in _FULL_ACCESS_ROLES:
+            print(
+                f"  WARNING: {ROLE_ATTRIBUTE}={current!r} on the smoke-test user; "
+                "under Cedar ENFORCE only admin/developer can call every tool."
+            )
+        return
+    cognito_idp.admin_update_user_attributes(
+        UserPoolId=user_pool_id,
+        Username=username,
+        UserAttributes=[{"Name": ROLE_ATTRIBUTE, "Value": SMOKE_TEST_ROLE}],
+    )
+    print(f"  Set {ROLE_ATTRIBUTE}={SMOKE_TEST_ROLE} on the smoke-test user.")
+
+
 def acquire_cognito_jwt(
     session: boto3.Session,
     user_pool_id: str,
@@ -104,9 +140,13 @@ def acquire_cognito_jwt(
 ) -> str:
     """Get a Cognito ID token for the test user via USER_PASSWORD_AUTH.
 
-    Sets a temporary password on the user, then authenticates to get the token.
+    Gives the user a role if it has none (before authenticating, so the ID
+    token carries it), sets a temporary password, then authenticates to get
+    the token.
     """
     cognito_idp = session.client("cognito-idp")
+
+    ensure_user_role(cognito_idp, user_pool_id, username)
 
     # Generate a random password that meets Cognito requirements
     # Guarantee at least one char from each required class
